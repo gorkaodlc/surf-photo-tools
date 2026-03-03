@@ -1,28 +1,28 @@
-# 🏄 Surf Photo Tools
+# Surf Photo Tools
 
-Herramientas para organizar automáticamente sesiones de fotos de surf (JPG + ARW).
+Herramientas para organizar automaticamente sesiones de fotos de surf (JPG + ARW).
 
-Pensado para fotógrafos que disparan en ráfaga con cámaras Sony (a6400, a7 series, etc.) y necesitan clasificar cientos de fotos por ola y por surfista de forma rápida.
+Pensado para fotografos que disparan en rafaga con camaras Sony (a6400, a7 series, etc.) y necesitan clasificar cientos de fotos por ola y por surfista de forma rapida.
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
-## 🌊 Wave Splitter
+## Wave Splitter
 
-Agrupa automáticamente las fotos por ola/secuencia usando los timestamps EXIF.
+Agrupa automaticamente las fotos por ola/secuencia usando los timestamps EXIF.
 
-**¿Cómo funciona?**  
-Cuando disparas en ráfaga a un surfista, las fotos tienen timestamps muy cercanos (milisegundos). Entre ola y ola hay un gap de varios segundos. Wave Splitter detecta esos gaps y agrupa las fotos en carpetas.
+**Como funciona?**
+Cuando disparas en rafaga a un surfista, las fotos tienen timestamps muy cercanos (milisegundos). Entre ola y ola hay un gap de varios segundos. Wave Splitter detecta esos gaps y agrupa las fotos en carpetas.
 
-**Características:**
-- Lectura automática de EXIF timestamps
-- Slider para ajustar el umbral de separación entre olas (2-60s) en tiempo real
-- Detección de surfista con YOLOv8 para generar thumbnails con zoom automático
-- Preview de cada secuencia con rango horario y número de fotos
+**Caracteristicas:**
+- Lectura automatica de EXIF timestamps
+- Slider para ajustar el umbral de separacion entre olas (2-60s) en tiempo real
+- Deteccion de surfista con YOLOv8 para generar thumbnails con zoom automatico
+- Preview de cada secuencia con rango horario y numero de fotos
 - Nombres de carpeta editables y posibilidad de excluir olas
-- Manejo de nombres duplicados con subcarpetas automáticas
+- Manejo de nombres duplicados con subcarpetas automaticas
 - Carpeta `sin_clasificar` para fotos sin datos EXIF
 - Manifiesto JSON con el registro completo de cada archivo
 - Barra de progreso y log en tiempo real
@@ -44,16 +44,16 @@ salida/
 
 ---
 
-## 📁 Surf Organizer
+## Surf Organizer
 
-Organiza las fotos ya clasificadas por surfista, separando JPG y RAW en una estructura limpia lista para edición.
+Organiza las fotos ya clasificadas por surfista, separando JPG y RAW en una estructura limpia lista para edicion.
 
-**¿Cómo funciona?**  
-Después de clasificar las fotos por surfista en carpetas con su nombre, Surf Organizer empareja cada JPG con su RAW correspondiente y los organiza en una estructura optimizada para Lightroom / Capture One.
+**Como funciona?**
+Despues de clasificar las fotos por surfista en carpetas con su nombre, Surf Organizer empareja cada JPG con su RAW correspondiente y los organiza en una estructura optimizada para Lightroom / Capture One.
 
-**Características:**
-- Emparejamiento automático JPG ↔ ARW por nombre de archivo
-- Detección de surfista con HOG + saliencia para avatares con zoom
+**Caracteristicas:**
+- Emparejamiento automatico JPG - ARW por nombre de archivo
+- Deteccion de surfista con HOG + saliencia para avatares con zoom
 - Vista previa con posibilidad de excluir fotos individuales
 - Click en el avatar para rotar entre fotos del surfista
 - Carpeta `editadas/` lista para exportar revelados
@@ -92,19 +92,19 @@ salida/
 ## Flujo de trabajo recomendado
 
 ```
-📷 Sesión de fotos
-        │
-        ▼
-🌊 Wave Splitter ──► Agrupa por ola automáticamente
-        │
-        ▼
-   Revisión manual ──► Renombras las carpetas con el nombre de cada surfista
-        │
-        ▼
-📁 Surf Organizer ──► Estructura final lista para editar
-        │
-        ▼
-   🎨 Lightroom / Capture One
+Sesion de fotos
+       |
+       v
+Wave Splitter ----> Agrupa por ola automaticamente
+       |
+       v
+Revision manual --> Renombras las carpetas con el nombre de cada surfista
+       |
+       v
+Surf Organizer ---> Estructura final lista para editar
+       |
+       v
+Lightroom / Capture One
 ```
 
 ---
@@ -114,7 +114,7 @@ salida/
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (gestor de paquetes)
 
-## Instalación
+## Instalacion
 
 ```bash
 # Clonar el repositorio
@@ -124,19 +124,19 @@ cd surf-photo-tools
 # Wave Splitter
 cd wave-splitter
 uv sync
-uv run wave_splitter.py    # → http://127.0.0.1:5070
+uv run wave_splitter.py    # -> http://127.0.0.1:5070
 
 # Surf Organizer
 cd ../surf-organizer
 uv sync
-uv run surf_organizer_web.py    # → http://127.0.0.1:5050
+uv run surf_organizer_web.py    # -> http://127.0.0.1:5050
 ```
 
-> La primera vez que uses Wave Splitter, se descargará el modelo YOLOv8 nano (~6MB) automáticamente.
+> La primera vez que uses Wave Splitter, se descargara el modelo YOLOv8 nano (~6MB) automaticamente.
 
-## Cámaras compatibles
+## Camaras compatibles
 
-Probado con Sony a6400. Debería funcionar con cualquier cámara que genere archivos `.ARW` y `.JPG` con el mismo nombre base. Si tu cámara usa otro formato RAW (`.CR3`, `.NEF`, `.RAF`...), abre un issue y lo añadimos.
+Probado con Sony a6400. Deberia funcionar con cualquier camara que genere archivos `.ARW` y `.JPG` con el mismo nombre base. Si tu camara usa otro formato RAW (`.CR3`, `.NEF`, `.RAF`...), abre un issue y lo añadimos.
 
 ## Licencia
 
