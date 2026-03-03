@@ -2,7 +2,7 @@
 
 Herramientas para organizar automaticamente sesiones de fotos de surf (JPG + ARW).
 
-Pensado para fotografos que disparan en rafaga con camaras Sony (a6400, a7 series, etc.) y necesitan clasificar cientos de fotos por ola y por surfista de forma rapida.
+Pensado para fotografos que disparan en rafaga con camaras reflex y necesitan clasificar cientos de fotos por ola y por surfista de forma rapida.
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
