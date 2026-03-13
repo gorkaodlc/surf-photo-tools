@@ -407,6 +407,14 @@ HTML_TEMPLATE = r"""
   .new-folder-row { display: flex; gap: 8px; margin-bottom: 10px; }
   .new-folder-row input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; color: var(--text); font-size: 0.85rem; outline: none; }
   .new-folder-row input::placeholder { color: var(--text2); }
+
+  .wave-actions { display: flex; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .btn-join { background: transparent; color: var(--text2); border: 1px solid var(--border); font-size: 0.75rem; padding: 4px 10px; border-radius: 6px; cursor: pointer; transition: all .15s; }
+  .btn-join:hover { border-color: var(--accent); color: var(--accent); }
+
+  #split-menu { display: none; position: fixed; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 4px; z-index: 200; box-shadow: 0 4px 20px #0008; min-width: 180px; }
+  .split-menu-item { padding: 9px 14px; cursor: pointer; border-radius: 6px; font-size: 0.85rem; }
+  .split-menu-item:hover { background: var(--surface2); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -488,6 +496,10 @@ HTML_TEMPLATE = r"""
       <button class="btn btn-primary" onclick="selectDir()">Seleccionar esta carpeta</button>
     </div>
   </div>
+</div>
+
+<div id="split-menu">
+  <div class="split-menu-item" onclick="doSplit()">✂ Separar desde aquí</div>
 </div>
 
 <script>
@@ -616,6 +628,10 @@ function regroup() {
   }
   if (wave.length) currentWaves.push(wave);
 
+  currentWaves.forEach(function(w, i) {
+    w.waveName = 'ola_' + String(i + 1).padStart(3, '0');
+  });
+
   const totalPhotos = allPhotos.length + noExifPhotos.length;
   const withRaw = allPhotos.filter(p => p.has_raw).length + noExifPhotos.filter(p => p.has_raw).length;
   document.getElementById("scan-stats").innerHTML =
@@ -648,7 +664,7 @@ function renderWaves() {
         '</div>' +
         '<div class="wave-info">' +
           '<h3>' +
-            '<input type="text" class="wave-name-input" id="wave-name-' + idx + '" value="ola_' + num + '" title="Editar nombre">' +
+            '<input type="text" class="wave-name-input" id="wave-name-' + idx + '" value="' + (wave.waveName || ('ola_' + num)) + '" title="Editar nombre">' +
             ' <span class="badge">' + wave.length + ' fotos</span>' +
             (noRaw ? ' <span class="badge warn">' + noRaw + ' sin RAW</span>' : '') +
           '</h3>' +
@@ -657,11 +673,13 @@ function renderWaves() {
           '<div class="wave-photos" id="dots-' + idx + '">' +
             wave.map(function(p, pi) {
               return '<div class="wave-photo-dot ' + (p.has_raw ? '' : 'no-raw') + (pi === 0 ? ' active' : '') +
-                '" title="' + p.jpg + '" onclick="showWavePhoto(' + idx + ',' + pi + ')"></div>';
+                '" title="' + p.jpg + '" onclick="showWavePhoto(' + idx + ',' + pi + ')" oncontextmenu="showSplitMenu(event,' + idx + ',' + pi + ')"></div>';
             }).join('') +
           '</div>' +
         '</div>' +
-      '</div>';
+      '</div>' +
+      (idx < currentWaves.length - 1 ?
+        '<div class="wave-actions"><button class="btn-join" onclick="joinWaves(' + idx + ')">⊕ Unir con siguiente</button></div>' : '');
     container.appendChild(block);
 
     waveThumbIdx[idx] = 0;
@@ -774,6 +792,64 @@ function startCopy() {
     .then(function(r) { return r.json(); })
     .then(function(d) { if (d.stream_id) listenProgress(d.stream_id); });
 }
+
+// ── Join & Split ───────────────────────────────────────────
+
+function syncWaveNames() {
+  currentWaves.forEach(function(wave, idx) {
+    var inp = document.getElementById('wave-name-' + idx);
+    if (inp) wave.waveName = inp.value.trim() || wave.waveName;
+  });
+}
+
+function joinWaves(idx) {
+  if (idx >= currentWaves.length - 1) return;
+  syncWaveNames();
+  var merged = currentWaves[idx].concat(currentWaves[idx + 1]);
+  merged.waveName = currentWaves[idx].waveName;
+  currentWaves.splice(idx, 2, merged);
+  renderWaves();
+}
+
+function splitWave(waveIdx, photoIdx) {
+  if (photoIdx <= 0 || photoIdx >= currentWaves[waveIdx].length) return;
+  syncWaveNames();
+  var wave = currentWaves[waveIdx];
+  var part1 = wave.slice(0, photoIdx);
+  var part2 = wave.slice(photoIdx);
+  part1.waveName = wave.waveName;
+  part2.waveName = wave.waveName + '_b';
+  currentWaves.splice(waveIdx, 1, part1, part2);
+  renderWaves();
+}
+
+// Split context menu
+var _splitTarget = null;
+
+function showSplitMenu(event, waveIdx, photoIdx) {
+  event.preventDefault();
+  if (photoIdx === 0) return;
+  _splitTarget = { waveIdx: waveIdx, photoIdx: photoIdx };
+  var menu = document.getElementById('split-menu');
+  menu.style.display = 'block';
+  menu.style.left = event.clientX + 'px';
+  menu.style.top = event.clientY + 'px';
+}
+
+function hideSplitMenu() {
+  document.getElementById('split-menu').style.display = 'none';
+  _splitTarget = null;
+}
+
+function doSplit() {
+  if (!_splitTarget) return;
+  splitWave(_splitTarget.waveIdx, _splitTarget.photoIdx);
+  hideSplitMenu();
+}
+
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('#split-menu')) hideSplitMenu();
+});
 
 function listenProgress(streamId) {
   var es = new EventSource("/api/progress/" + streamId);

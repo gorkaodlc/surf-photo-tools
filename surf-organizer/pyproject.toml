@@ -1,9 +1,9 @@
 [project]
 name = "surf-organizer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Organiza fotos JPG + ARW de surf por surfista"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "flask>=3.1.3",
     "opencv-contrib-python-headless>=4.13.0.92",
