@@ -29,7 +29,7 @@ from queue import Queue
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify, Response, render_template_string
-from PIL import Image
+from PIL import Image, ImageOps
 from PIL.ExifTags import Base as ExifBase
 from ultralytics import YOLO
 
@@ -72,18 +72,18 @@ def make_thumbnail_b64(filepath: Path, size: int = 300) -> str | None:
         return None
 
 
-def scan_photos(jpg_dir: Path, raw_dir: Path):
+def scan_photos(jpg_dir: Path, raw_dir: Path, jpg_ext: str = ".jpg", raw_ext: str = ".arw"):
     raw_index = {}
-    if raw_dir.is_dir():
+    if raw_ext != "none" and raw_dir.is_dir():
         for f in raw_dir.iterdir():
-            if f.suffix.lower() == ".arw":
+            if f.suffix.lower() == raw_ext.lower():
                 raw_index[f.stem.lower()] = f.name
 
     photos = []
     no_exif = []
 
     jpg_files = sorted(
-        [f for f in jpg_dir.iterdir() if f.suffix.lower() == ".jpg"],
+        [f for f in jpg_dir.iterdir() if f.suffix.lower() == jpg_ext.lower()],
         key=lambda x: x.name.lower()
     )
 
@@ -112,6 +112,7 @@ def scan_photos(jpg_dir: Path, raw_dir: Path):
 # ══════════════════════════════════════════════════════════════════════
 
 _yolo_model = None
+_detection_cache: dict[str, dict] = {}
 
 PERSON_CLASS = 0
 SURFBOARD_CLASS = 37
@@ -188,7 +189,8 @@ def _try_yolo(img):
         cy = y1 + (y2 - y1) // 3
         bw, bh = x2 - x1, y2 - y1
         radius = int(max(bw, bh) * 0.6)
-        return _make_square_crop(img, cx, cy, radius)
+        bbox = (x1 / w, y1 / h, x2 / w, y2 / h)
+        return _make_square_crop(img, cx, cy, radius), bbox
 
     # Prioridad 2: tabla detectada (el surfista está encima/al lado)
     if best_board:
@@ -200,9 +202,10 @@ def _try_yolo(img):
         cy = max(0, cy)
         bw = x2 - x1
         radius = int(max(bw, bh) * 1.2)
-        return _make_square_crop(img, cx, cy, radius)
+        bbox = (x1 / w, y1 / h, x2 / w, y2 / h)
+        return _make_square_crop(img, cx, cy, radius), bbox
 
-    return None
+    return None, None
 
 
 def _try_dual_saliency(img, small, scale):
@@ -255,44 +258,57 @@ def _center_crop(img):
     return _make_square_crop(img, w // 2, h // 2, radius)
 
 
-def detect_person_thumbnail(filepath: Path) -> str | None:
+def get_photo_detection(filepath: Path) -> dict:
     """
-    Pipeline de detección de surfista:
-      1. YOLO multi-escala (person + surfboard, 3 resoluciones)
-      2. Doble saliencia (fallback visual)
-      3. Center crop (último recurso)
+    Pipeline de detección de surfista. Devuelve {crop: b64|None, bbox: [x1n,y1n,x2n,y2n]|None}.
+    Resultado cacheado por ruta de archivo.
     """
+    key = str(filepath)
+    if key in _detection_cache:
+        return _detection_cache[key]
+
+    result: dict = {"crop": None, "bbox": None}
     try:
-        img = cv2.imread(str(filepath))
+        img = cv2.imread(key)
         if img is None:
-            return None
+            _detection_cache[key] = result
+            return result
 
         h, w = img.shape[:2]
 
         # Fase 1: YOLO
-        crop = _try_yolo(img)
+        crop_arr, bbox = _try_yolo(img)
 
-        # Fase 2: Saliencia
-        if crop is None:
+        # Fase 2: Saliencia (sin bbox)
+        if crop_arr is None:
             sc = 640 / max(h, w)
             if sc < 1:
                 small = cv2.resize(img, (int(w * sc), int(h * sc)))
             else:
                 small = img
                 sc = 1.0
-            crop = _try_dual_saliency(img, small, sc)
+            crop_arr = _try_dual_saliency(img, small, sc)
 
         # Fase 3: Center crop
-        if crop is None:
-            crop = _center_crop(img)
+        if crop_arr is None:
+            crop_arr = _center_crop(img)
 
-        if crop is None:
-            return None
+        if crop_arr is not None:
+            _, buf = cv2.imencode(".jpg", crop_arr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            result["crop"] = base64.b64encode(buf).decode()
 
-        _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        return base64.b64encode(buf).decode()
+        if bbox:
+            result["bbox"] = list(bbox)
+
     except Exception:
-        return None
+        pass
+
+    _detection_cache[key] = result
+    return result
+
+
+def detect_person_thumbnail(filepath: Path) -> str | None:
+    return get_photo_detection(filepath)["crop"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -408,9 +424,31 @@ HTML_TEMPLATE = r"""
   .new-folder-row input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; color: var(--text); font-size: 0.85rem; outline: none; }
   .new-folder-row input::placeholder { color: var(--text2); }
 
-  .wave-actions { display: flex; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
-  .btn-join { background: transparent; color: var(--text2); border: 1px solid var(--border); font-size: 0.75rem; padding: 4px 10px; border-radius: 6px; cursor: pointer; transition: all .15s; }
-  .btn-join:hover { border-color: var(--accent); color: var(--accent); }
+  .drag-handle { color: var(--text2); font-size: 1.1rem; cursor: grab; padding: 4px 6px; border-radius: 4px; user-select: none; flex-shrink: 0; line-height: 1; }
+  .drag-handle:hover { color: var(--accent); background: var(--surface); }
+  .wave-block.dragging { opacity: .35; }
+  .wave-block.drag-over { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(14,165,233,0.3); }
+
+  .format-select { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; color: var(--text); font-size: 0.85rem; outline: none; cursor: pointer; transition: border .2s; flex-shrink: 0; }
+  .format-select:focus { border-color: var(--accent); }
+  .raw-dir-row { transition: opacity .2s; }
+  .raw-dir-row.disabled input, .raw-dir-row.disabled button { opacity: .4; pointer-events: none; }
+
+  .lightbox-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.93); z-index: 300; align-items: center; justify-content: center; flex-direction: column; }
+  .lightbox-bg.open { display: flex; }
+  .lightbox-wrap { position: relative; display: inline-flex; max-width: 90vw; max-height: 82vh; }
+  .lightbox-img { max-width: 90vw; max-height: 82vh; object-fit: contain; border-radius: 4px; transition: opacity .15s; display: block; }
+#lightbox-detect-crop { position: absolute; bottom: 12px; left: 12px; width: 165px; height: 165px; border-radius: 8px; border: 2px solid rgba(255,255,255,0.75); object-fit: cover; box-shadow: 0 2px 16px rgba(0,0,0,0.7); display: none; }
+  .lightbox-close { position: absolute; top: 16px; right: 20px; background: none; border: none; color: #fff; font-size: 2rem; cursor: pointer; opacity: .7; line-height: 1; }
+  .lightbox-close:hover { opacity: 1; }
+  .lightbox-nav { position: absolute; top: 50%; transform: translateY(-50%); background: none; border: none; color: #fff; font-size: 3.5rem; cursor: pointer; opacity: .45; padding: 16px; line-height: 1; }
+  .lightbox-nav:hover { opacity: 1; }
+  .lightbox-prev { left: 4px; }
+  .lightbox-next { right: 4px; }
+  .lightbox-footer { display: flex; align-items: center; gap: 14px; margin-top: 10px; }
+  .lightbox-caption { color: rgba(255,255,255,0.55); font-size: 0.8rem; }
+  .lightbox-split-btn { padding: 6px 14px; background: var(--red); color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; transition: background .15s; }
+  .lightbox-split-btn:hover { background: #dc2626; }
 
   #split-menu { display: none; position: fixed; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 4px; z-index: 200; box-shadow: 0 4px 20px #0008; min-width: 180px; }
   .split-menu-item { padding: 9px 14px; cursor: pointer; border-radius: 6px; font-size: 0.85rem; }
@@ -419,29 +457,49 @@ HTML_TEMPLATE = r"""
 </head>
 <body>
 <div class="container">
-  <h1>🌊 Wave Splitter</h1>
+  <h1>Wave Splitter</h1>
   <p class="subtitle">Agrupa automáticamente tus fotos de surf por ola usando timestamps EXIF</p>
 
   <div class="card" id="step-paths">
-    <h2>📂 Directorios</h2>
+    <h2>Directorios</h2>
     <div class="field">
-      <label>Carpeta de JPGs (todas las fotos sueltas)</label>
+      <label>Carpeta de fotos procesadas</label>
       <div class="input-row">
-        <input id="inp-jpg" type="text" placeholder="/ruta/a/jpg">
+        <input id="inp-jpg" type="text" placeholder="/ruta/a/fotos" onkeydown="if(event.key==='Enter')scan()">
+        <select id="sel-jpg-ext" class="format-select">
+          <option value=".jpg">JPG</option>
+          <option value=".jpeg">JPEG</option>
+          <option value=".png">PNG</option>
+          <option value=".tiff">TIFF</option>
+          <option value=".heic">HEIC</option>
+          <option value=".webp">WebP</option>
+        </select>
         <button class="btn btn-browse" onclick="openBrowser('inp-jpg')">Explorar</button>
       </div>
     </div>
-    <div class="field">
-      <label>Carpeta de RAWs (todos los .ARW sueltos)</label>
+    <div class="field raw-dir-row" id="raw-dir-row">
+      <label>Carpeta de RAW</label>
       <div class="input-row">
-        <input id="inp-raw" type="text" placeholder="/ruta/a/raw">
+        <input id="inp-raw" type="text" placeholder="/ruta/a/raw" onkeydown="if(event.key==='Enter')scan()">
+        <select id="sel-raw-ext" class="format-select" onchange="onRawExtChange()">
+          <option value=".arw">ARW (Sony)</option>
+          <option value=".cr3">CR3 (Canon)</option>
+          <option value=".cr2">CR2 (Canon)</option>
+          <option value=".nef">NEF (Nikon)</option>
+          <option value=".raf">RAF (Fujifilm)</option>
+          <option value=".dng">DNG</option>
+          <option value=".orf">ORF (Olympus)</option>
+          <option value=".rw2">RW2 (Panasonic)</option>
+          <option value=".pef">PEF (Pentax)</option>
+          <option value="none">Sin RAW</option>
+        </select>
         <button class="btn btn-browse" onclick="openBrowser('inp-raw')">Explorar</button>
       </div>
     </div>
     <div class="field">
       <label>Carpeta de salida</label>
       <div class="input-row">
-        <input id="inp-out" type="text" placeholder="/ruta/a/salida">
+        <input id="inp-out" type="text" placeholder="/ruta/a/salida" onkeydown="if(event.key==='Enter')scan()">
         <button class="btn btn-browse" onclick="openBrowser('inp-out')">Explorar</button>
       </div>
     </div>
@@ -451,11 +509,11 @@ HTML_TEMPLATE = r"""
   </div>
 
   <div class="card hidden" id="step-preview">
-    <h2>📋 Secuencias detectadas</h2>
+    <h2>Secuencias detectadas</h2>
     <div class="scan-stats" id="scan-stats"></div>
     <div class="slider-row">
       <label style="white-space:nowrap; font-size:0.85rem;">Umbral de separación:</label>
-      <input type="range" id="gap-slider" min="2" max="60" value="10" oninput="regroup()">
+      <input type="range" id="gap-slider" min="2" max="60" value="10" oninput="document.getElementById('gap-val').textContent=this.value+'s'" onchange="regroup()">
       <div class="slider-val" id="gap-val">10s</div>
     </div>
     <div id="waves-container"></div>
@@ -467,11 +525,11 @@ HTML_TEMPLATE = r"""
   </div>
 
   <div class="card hidden" id="step-progress">
-    <h2>⚙️ Progreso</h2>
+    <h2>Progreso</h2>
     <div class="progress-bar-outer"><div class="progress-bar-inner" id="pbar">0%</div></div>
     <div class="log-box" id="log-box"></div>
     <div class="summary-box hidden" id="summary-box">
-      <h3>✅ Completado</h3>
+      <h3>Completado</h3>
       <div id="summary-content"></div>
     </div>
   </div>
@@ -502,7 +560,22 @@ HTML_TEMPLATE = r"""
   <div class="split-menu-item" onclick="doSplit()">✂ Separar desde aquí</div>
 </div>
 
+<div class="lightbox-bg" id="lightbox" onclick="if(event.target===this)closeLightbox()">
+  <button class="lightbox-close" onclick="closeLightbox()">✕</button>
+  <button class="lightbox-nav lightbox-prev" onclick="navLightbox(-1)">‹</button>
+  <div class="lightbox-wrap">
+    <img class="lightbox-img" id="lightbox-img" src="" alt="">
+    <img id="lightbox-detect-crop" src="" alt="Detección">
+  </div>
+  <div class="lightbox-footer">
+    <span class="lightbox-caption" id="lightbox-caption"></span>
+    <button class="lightbox-split-btn" id="lightbox-split-btn" onclick="splitFromLightbox()" style="display:none">✂ Separar desde aquí</button>
+  </div>
+  <button class="lightbox-nav lightbox-next" onclick="navLightbox(1)">›</button>
+</div>
+
 <script>
+const HOME_DIR = {{ home_dir | tojson }};
 let browseTarget = null;
 let browseCurrent = "";
 let allPhotos = [];
@@ -513,7 +586,7 @@ let waveThumbIdx = {};
 
 async function openBrowser(inputId) {
   browseTarget = inputId;
-  const start = document.getElementById(inputId).value || "/";
+  const start = document.getElementById(inputId).value || HOME_DIR;
   await loadDir(start);
   document.getElementById("modal-browse").classList.add("open");
   document.getElementById("new-folder-name").value = "";
@@ -560,8 +633,10 @@ async function scan() {
   document.getElementById("btn-scan").textContent = "⏳ Leyendo EXIF...";
 
   try {
+    const jpgExt = document.getElementById("sel-jpg-ext").value;
+    const rawExt = document.getElementById("sel-raw-ext").value;
     const r = await fetch("/api/scan", { method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({jpg_dir: jpg, raw_dir: raw}) });
+      body: JSON.stringify({jpg_dir: jpg, raw_dir: raw, jpg_ext: jpgExt, raw_ext: rawExt}) });
 
     if (!r.ok) { alert("Error del servidor: " + r.status); return; }
 
@@ -613,6 +688,7 @@ function regroup() {
   document.getElementById("gap-val").textContent = gap + "s";
 
   currentWaves = [];
+  waveThumbIdx = {};
   if (allPhotos.length === 0) { renderWaves(); return; }
 
   let wave = [allPhotos[0]];
@@ -656,10 +732,11 @@ function renderWaves() {
     block.id = "wave-block-" + idx;
     block.innerHTML =
       '<div class="wave-header">' +
+        '<div class="drag-handle" draggable="true" title="Arrastrar para unir con otra ola">⠿</div>' +
         '<input type="checkbox" class="wave-toggle" id="wave-toggle-' + idx + '" checked onchange="toggleWave(' + idx + ')" title="Incluir / excluir">' +
         '<div>' +
-          '<img class="wave-thumb" id="thumb-' + idx + '" onclick="cycleWaveThumb(' + idx + ')" ' +
-            'src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" title="Clic para cambiar foto">' +
+          '<img class="wave-thumb" id="thumb-' + idx + '" onclick="openLightbox(' + idx + ', waveThumbIdx[' + idx + '] || 0)" ' +
+            'src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" title="Clic para ver foto completa">' +
           '<div class="wave-thumb-counter" id="thumb-counter-' + idx + '"></div>' +
         '</div>' +
         '<div class="wave-info">' +
@@ -677,10 +754,9 @@ function renderWaves() {
             }).join('') +
           '</div>' +
         '</div>' +
-      '</div>' +
-      (idx < currentWaves.length - 1 ?
-        '<div class="wave-actions"><button class="btn-join" onclick="joinWaves(' + idx + ')">⊕ Unir con siguiente</button></div>' : '');
+      '</div>';
     container.appendChild(block);
+    setupDragHandlers(block, idx);
 
     waveThumbIdx[idx] = 0;
     loadWaveThumb(idx, 0);
@@ -802,12 +878,56 @@ function syncWaveNames() {
   });
 }
 
-function joinWaves(idx) {
-  if (idx >= currentWaves.length - 1) return;
+var _dragSrcIdx = null;
+
+function setupDragHandlers(block, idx) {
+  var handle = block.querySelector('.drag-handle');
+
+  handle.addEventListener('dragstart', function(e) {
+    _dragSrcIdx = idx;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(idx));
+    setTimeout(function() { block.classList.add('dragging'); }, 0);
+  });
+
+  handle.addEventListener('dragend', function() {
+    block.classList.remove('dragging');
+    _dragSrcIdx = null;
+    document.querySelectorAll('.wave-block.drag-over').forEach(function(b) {
+      b.classList.remove('drag-over');
+    });
+  });
+
+  block.addEventListener('dragover', function(e) {
+    if (_dragSrcIdx === null || _dragSrcIdx === idx) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    block.classList.add('drag-over');
+  });
+
+  block.addEventListener('dragleave', function(e) {
+    if (!block.contains(e.relatedTarget)) {
+      block.classList.remove('drag-over');
+    }
+  });
+
+  block.addEventListener('drop', function(e) {
+    e.preventDefault();
+    block.classList.remove('drag-over');
+    if (_dragSrcIdx === null || _dragSrcIdx === idx) return;
+    mergeWaves(_dragSrcIdx, idx);
+  });
+}
+
+function mergeWaves(srcIdx, dstIdx) {
   syncWaveNames();
-  var merged = currentWaves[idx].concat(currentWaves[idx + 1]);
-  merged.waveName = currentWaves[idx].waveName;
-  currentWaves.splice(idx, 2, merged);
+  var merged = currentWaves[dstIdx].concat(currentWaves[srcIdx]);
+  merged.sort(function(a, b) { return new Date(a.datetime_full) - new Date(b.datetime_full); });
+  merged.waveName = currentWaves[dstIdx].waveName;
+  var lo = Math.min(srcIdx, dstIdx), hi = Math.max(srcIdx, dstIdx);
+  currentWaves.splice(hi, 1);
+  currentWaves.splice(lo, 1);
+  currentWaves.splice(lo, 0, merged);
   renderWaves();
 }
 
@@ -851,6 +971,81 @@ document.addEventListener('click', function(e) {
   if (!e.target.closest('#split-menu')) hideSplitMenu();
 });
 
+// ── Formato RAW opcional ────────────────────────────────────
+
+function onRawExtChange() {
+  var val = document.getElementById('sel-raw-ext').value;
+  document.getElementById('raw-dir-row').classList.toggle('disabled', val === 'none');
+}
+
+// ── Lightbox ────────────────────────────────────────────────
+
+var _lbWave = null, _lbIdx = null;
+
+function openLightbox(waveIdx, photoIdx) {
+  _lbWave = waveIdx;
+  _lbIdx = photoIdx;
+  document.getElementById('lightbox').classList.add('open');
+  loadLightboxPhoto();
+}
+
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lightbox-img').src = '';
+  document.getElementById('lightbox-detect-crop').style.display = 'none';
+}
+
+function navLightbox(dir) {
+  var wave = currentWaves[_lbWave];
+  _lbIdx = (_lbIdx + dir + wave.length) % wave.length;
+  loadLightboxPhoto();
+}
+
+async function loadLightboxPhoto() {
+  var wave = currentWaves[_lbWave];
+  var photo = wave[_lbIdx];
+  var jpg = document.getElementById("inp-jpg").value.trim();
+  var imgEl = document.getElementById('lightbox-img');
+  var caption = document.getElementById('lightbox-caption');
+  var splitBtn = document.getElementById('lightbox-split-btn');
+  var detectCrop = document.getElementById('lightbox-detect-crop');
+
+  imgEl.style.opacity = '0.35';
+  caption.textContent = photo.jpg + '  (' + (_lbIdx + 1) + ' / ' + wave.length + ')';
+  splitBtn.style.display = _lbIdx > 0 ? '' : 'none';
+  detectCrop.style.display = 'none';
+
+  try {
+    var r = await fetch("/api/photo-full", { method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({jpg_dir: jpg, filename: photo.jpg}) });
+    var data = await r.json();
+    if (data.data) {
+      imgEl.onload = function() {
+        if (data.crop) {
+          detectCrop.src = "data:image/jpeg;base64," + data.crop;
+          detectCrop.style.display = 'block';
+        }
+      };
+      imgEl.src = "data:image/jpeg;base64," + data.data;
+      imgEl.style.opacity = '1';
+    }
+  } catch(e) { console.error(e); }
+}
+
+function splitFromLightbox() {
+  if (_lbWave === null || _lbIdx === null || _lbIdx === 0) return;
+  var wi = _lbWave, pi = _lbIdx;
+  closeLightbox();
+  splitWave(wi, pi);
+}
+
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('lightbox').classList.contains('open')) return;
+  if (e.key === 'Escape') closeLightbox();
+  if (e.key === 'ArrowLeft') navLightbox(-1);
+  if (e.key === 'ArrowRight') navLightbox(1);
+});
+
 function listenProgress(streamId) {
   var es = new EventSource("/api/progress/" + streamId);
   var logBox = document.getElementById("log-box");
@@ -890,7 +1085,7 @@ function listenProgress(streamId) {
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML_TEMPLATE, home_dir=str(Path.home()))
 
 
 @app.route("/api/browse", methods=["POST"])
@@ -932,22 +1127,45 @@ def api_mkdir():
     return jsonify(path=str(new_dir))
 
 
+@app.route("/api/photo-full", methods=["POST"])
+def api_photo_full():
+    data = request.json
+    jpg_dir = Path(data["jpg_dir"])
+    filename = data["filename"]
+    filepath = jpg_dir / filename
+    if not filepath.exists():
+        return jsonify(error="Archivo no encontrado")
+    try:
+        with Image.open(filepath) as img:
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((1920, 1920), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
+        det = get_photo_detection(filepath)
+        return jsonify(data=img_b64, crop=det["crop"], bbox=det["bbox"])
+    except Exception as e:
+        return jsonify(error=str(e))
+
+
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     data = request.json
     jpg_dir = Path(data["jpg_dir"])
     raw_dir = Path(data["raw_dir"])
+    jpg_ext = data.get("jpg_ext", ".jpg")
+    raw_ext = data.get("raw_ext", ".arw")
 
     if not jpg_dir.is_dir():
         return jsonify(error=f"Carpeta JPG no existe: {jpg_dir}")
-    if not raw_dir.is_dir():
+    if raw_ext != "none" and not raw_dir.is_dir():
         return jsonify(error=f"Carpeta RAW no existe: {raw_dir}")
 
     all_items = list(jpg_dir.iterdir())
     total_files = sum(1 for f in all_items if f.is_file())
     subdirs = sum(1 for f in all_items if f.is_dir())
 
-    photos, no_exif = scan_photos(jpg_dir, raw_dir)
+    photos, no_exif = scan_photos(jpg_dir, raw_dir, jpg_ext=jpg_ext, raw_ext=raw_ext)
 
     for p in photos:
         del p["datetime"]
