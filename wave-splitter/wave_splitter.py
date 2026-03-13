@@ -408,9 +408,10 @@ HTML_TEMPLATE = r"""
   .new-folder-row input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; color: var(--text); font-size: 0.85rem; outline: none; }
   .new-folder-row input::placeholder { color: var(--text2); }
 
-  .wave-actions { display: flex; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
-  .btn-join { background: transparent; color: var(--text2); border: 1px solid var(--border); font-size: 0.75rem; padding: 4px 10px; border-radius: 6px; cursor: pointer; transition: all .15s; }
-  .btn-join:hover { border-color: var(--accent); color: var(--accent); }
+  .drag-handle { color: var(--text2); font-size: 1.1rem; cursor: grab; padding: 4px 6px; border-radius: 4px; user-select: none; flex-shrink: 0; line-height: 1; }
+  .drag-handle:hover { color: var(--accent); background: var(--surface); }
+  .wave-block.dragging { opacity: .35; }
+  .wave-block.drag-over { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(14,165,233,0.3); }
 
   #split-menu { display: none; position: fixed; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 4px; z-index: 200; box-shadow: 0 4px 20px #0008; min-width: 180px; }
   .split-menu-item { padding: 9px 14px; cursor: pointer; border-radius: 6px; font-size: 0.85rem; }
@@ -656,6 +657,7 @@ function renderWaves() {
     block.id = "wave-block-" + idx;
     block.innerHTML =
       '<div class="wave-header">' +
+        '<div class="drag-handle" draggable="true" title="Arrastrar para unir con otra ola">⠿</div>' +
         '<input type="checkbox" class="wave-toggle" id="wave-toggle-' + idx + '" checked onchange="toggleWave(' + idx + ')" title="Incluir / excluir">' +
         '<div>' +
           '<img class="wave-thumb" id="thumb-' + idx + '" onclick="cycleWaveThumb(' + idx + ')" ' +
@@ -677,10 +679,9 @@ function renderWaves() {
             }).join('') +
           '</div>' +
         '</div>' +
-      '</div>' +
-      (idx < currentWaves.length - 1 ?
-        '<div class="wave-actions"><button class="btn-join" onclick="joinWaves(' + idx + ')">⊕ Unir con siguiente</button></div>' : '');
+      '</div>';
     container.appendChild(block);
+    setupDragHandlers(block, idx);
 
     waveThumbIdx[idx] = 0;
     loadWaveThumb(idx, 0);
@@ -802,12 +803,56 @@ function syncWaveNames() {
   });
 }
 
-function joinWaves(idx) {
-  if (idx >= currentWaves.length - 1) return;
+var _dragSrcIdx = null;
+
+function setupDragHandlers(block, idx) {
+  var handle = block.querySelector('.drag-handle');
+
+  handle.addEventListener('dragstart', function(e) {
+    _dragSrcIdx = idx;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(idx));
+    setTimeout(function() { block.classList.add('dragging'); }, 0);
+  });
+
+  handle.addEventListener('dragend', function() {
+    block.classList.remove('dragging');
+    _dragSrcIdx = null;
+    document.querySelectorAll('.wave-block.drag-over').forEach(function(b) {
+      b.classList.remove('drag-over');
+    });
+  });
+
+  block.addEventListener('dragover', function(e) {
+    if (_dragSrcIdx === null || _dragSrcIdx === idx) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    block.classList.add('drag-over');
+  });
+
+  block.addEventListener('dragleave', function(e) {
+    if (!block.contains(e.relatedTarget)) {
+      block.classList.remove('drag-over');
+    }
+  });
+
+  block.addEventListener('drop', function(e) {
+    e.preventDefault();
+    block.classList.remove('drag-over');
+    if (_dragSrcIdx === null || _dragSrcIdx === idx) return;
+    mergeWaves(_dragSrcIdx, idx);
+  });
+}
+
+function mergeWaves(srcIdx, dstIdx) {
   syncWaveNames();
-  var merged = currentWaves[idx].concat(currentWaves[idx + 1]);
-  merged.waveName = currentWaves[idx].waveName;
-  currentWaves.splice(idx, 2, merged);
+  var merged = currentWaves[dstIdx].concat(currentWaves[srcIdx]);
+  merged.sort(function(a, b) { return new Date(a.datetime_full) - new Date(b.datetime_full); });
+  merged.waveName = currentWaves[dstIdx].waveName;
+  var lo = Math.min(srcIdx, dstIdx), hi = Math.max(srcIdx, dstIdx);
+  currentWaves.splice(hi, 1);
+  currentWaves.splice(lo, 1);
+  currentWaves.splice(lo, 0, merged);
   renderWaves();
 }
 
