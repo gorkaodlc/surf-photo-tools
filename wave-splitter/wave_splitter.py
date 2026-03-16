@@ -315,60 +315,44 @@ def detect_person_thumbnail(filepath: Path) -> str | None:
 # Detección de surfistas — embeddings + clustering
 # ══════════════════════════════════════════════════════════════════════
 
-_embedding_model = None
-_embedding_transform = None
 _embedding_cache: dict[str, np.ndarray] = {}
 
 
-def _get_embedding_model():
-    """Carga ResNet-50 sin clasificador para extraer embeddings de 2048 dims.
-    Si PyTorch/torchvision no está disponible, usa histograma de color como fallback."""
-    global _embedding_model, _embedding_transform
-    if _embedding_model is not None:
-        return _embedding_model, _embedding_transform
+def _extract_person_features(crop_bgr: np.ndarray) -> np.ndarray:
+    """
+    Histograma de color HSV multi-región optimizado para fotografía de surf.
+    Los trajes de neopreno y tablas tienen colores y patrones muy distintivos,
+    lo que hace que el color sea el rasgo más discriminativo para este dominio.
 
-    print("📦 Cargando modelo de embeddings ResNet-50...")
-    try:
-        import torch
-        import torch.nn as nn
-        import torchvision.models as models
-        import torchvision.transforms as T
-
-        model = models.resnet50(weights="IMAGENET1K_V1")
-        model.fc = nn.Identity()  # eliminar clasificador → vector 2048-dim
-        model.eval()
-
-        transform = T.Compose([
-            T.Resize((224, 224)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-
-        _embedding_model = model
-        _embedding_transform = transform
-        print("✅ Modelo de embeddings cargado (ResNet-50)")
-        return model, transform
-    except Exception as e:
-        print(f"⚠ ResNet-50 no disponible ({e}), usando histograma de color como fallback")
-        _embedding_model = "histogram"
-        _embedding_transform = None
-        return "histogram", None
-
-
-def _color_histogram_embedding(crop_bgr: np.ndarray) -> np.ndarray:
-    """Fallback: histograma HSV de 96 dimensiones (32 bins × 3 canales)."""
+    Vector de 384 dims: 3 regiones verticales × (64 H + 32 S + 16 V) + global (32 H + 16 S)
+    """
+    h_img, w_img = crop_bgr.shape[:2]
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    features = []
-    for ch in range(3):
-        hist = cv2.calcHist([hsv], [ch], None, [32], [0, 256])
-        features.append(hist.flatten())
-    vec = np.concatenate(features).astype(np.float32)
+
+    # 3 franjas verticales: cabeza/nariz tabla · torso · piernas/cola tabla
+    regions = [
+        hsv[: h_img // 3],
+        hsv[h_img // 3 : 2 * h_img // 3],
+        hsv[2 * h_img // 3 :],
+    ]
+
+    parts = []
+    for region in regions:
+        parts.append(cv2.calcHist([region], [0], None, [64], [0, 180]).flatten())   # H fino
+        parts.append(cv2.calcHist([region], [1], None, [32], [0, 256]).flatten())   # S
+        parts.append(cv2.calcHist([region], [2], None, [16], [0, 256]).flatten())   # V grueso
+
+    # Histograma global a resolución más baja para contexto general de color
+    parts.append(cv2.calcHist([hsv], [0], None, [32], [0, 180]).flatten())
+    parts.append(cv2.calcHist([hsv], [1], None, [16], [0, 256]).flatten())
+
+    vec = np.concatenate(parts).astype(np.float32)
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
 
 
 def get_person_embedding(jpg_path: str) -> np.ndarray | None:
-    """Extrae embedding L2-normalizado del crop de persona ya cacheado."""
+    """Extrae features del crop de persona ya cacheado."""
     if jpg_path in _embedding_cache:
         return _embedding_cache[jpg_path]
 
@@ -383,25 +367,11 @@ def get_person_embedding(jpg_path: str) -> np.ndarray | None:
         if crop_bgr is None:
             return None
 
-        model, transform = _get_embedding_model()
-
-        if model == "histogram":
-            vec = _color_histogram_embedding(crop_bgr)
-        else:
-            import torch
-            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-            from PIL import Image as PILImage
-            pil_img = PILImage.fromarray(crop_rgb)
-            tensor = transform(pil_img).unsqueeze(0)
-            with torch.no_grad():
-                embedding = model(tensor).squeeze().numpy()
-            norm = np.linalg.norm(embedding)
-            vec = embedding / norm if norm > 0 else embedding
-
+        vec = _extract_person_features(crop_bgr)
         _embedding_cache[jpg_path] = vec
         return vec
     except Exception as e:
-        print(f"⚠ Error extrayendo embedding de {jpg_path}: {e}")
+        print(f"⚠ Error extrayendo features de {jpg_path}: {e}")
         return None
 
 
@@ -421,8 +391,13 @@ def get_wave_embedding(photos: list, jpg_dir: Path) -> np.ndarray | None:
 
 
 def cluster_waves_by_surfer(wave_embeddings: list, n_surfers: int | None = None) -> list[int]:
-    """Agrupa olas por surfista. Devuelve lista de IDs (0-indexed), -1 para olas sin persona."""
-    from sklearn.cluster import DBSCAN, KMeans
+    """
+    Agrupa olas por surfista usando AgglomerativeClustering (linkage='average', metric='cosine').
+    Cuando el número de surfistas es desconocido, selecciona el N óptimo por silhouette score.
+    Devuelve lista de IDs (0-indexed), -1 para olas sin persona detectada.
+    """
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.metrics import silhouette_score
     from sklearn.preprocessing import normalize
 
     valid_indices = [i for i, e in enumerate(wave_embeddings) if e is not None]
@@ -434,20 +409,34 @@ def cluster_waves_by_surfer(wave_embeddings: list, n_surfers: int | None = None)
         return result
 
     matrix = normalize([wave_embeddings[i] for i in valid_indices])
+    n_valid = len(valid_indices)
 
-    if n_surfers and n_surfers >= 1:
-        n = min(n_surfers, len(valid_indices))
-        raw_labels = KMeans(n_clusters=n, n_init=10, random_state=42).fit_predict(matrix)
+    if n_surfers and 1 <= n_surfers <= n_valid:
+        n = n_surfers
+    elif n_valid == 2:
+        n = 2
     else:
-        raw_labels = DBSCAN(eps=0.45, min_samples=1, metric="cosine").fit_predict(matrix)
+        # Silhouette-based auto-detection: probar n=2..min(8, n_valid) y elegir el mejor
+        best_n, best_score = 2, -1.0
+        for candidate_n in range(2, min(9, n_valid) + 1):
+            try:
+                labels_tmp = AgglomerativeClustering(
+                    n_clusters=candidate_n, metric="cosine", linkage="average"
+                ).fit_predict(matrix)
+                score = silhouette_score(matrix, labels_tmp, metric="cosine")
+                if score > best_score:
+                    best_score, best_n = score, candidate_n
+            except Exception:
+                pass
+        n = best_n
+        print(f"🏄 Auto-detección: {n} surfistas (silhouette={best_score:.3f})")
 
-    # Renumber labels to be consecutive 0-indexed
-    unique_labels = sorted(set(raw_labels))
-    label_map = {old: new for new, old in enumerate(unique_labels)}
-    labels = [label_map[l] for l in raw_labels]
+    raw_labels = AgglomerativeClustering(
+        n_clusters=n, metric="cosine", linkage="average"
+    ).fit_predict(matrix)
 
     result = [-1] * len(wave_embeddings)
-    for idx, label in zip(valid_indices, labels):
+    for idx, label in zip(valid_indices, raw_labels):
         result[idx] = int(label)
     return result
 
@@ -1252,9 +1241,21 @@ async function detectSurfers() {
   var nVal = document.getElementById("n-surfers-input").value;
   var nSurfers = nVal ? parseInt(nVal) : null;
 
-  var wavesData = currentWaves.map(function(w, i) {
-    return { name: w.waveName || ("ola_" + String(i+1).padStart(3,"0")), photos: w };
-  });
+  // Solo analizar olas que están activas (toggle activado)
+  var wavesData = currentWaves
+    .map(function(w, i) {
+      var toggle = document.getElementById("wave-toggle-" + i);
+      if (toggle && !toggle.checked) return null;
+      return { name: w.waveName || ("ola_" + String(i+1).padStart(3,"0")), photos: w };
+    })
+    .filter(Boolean);
+
+  if (wavesData.length === 0) {
+    alert("No hay olas activas para analizar");
+    btn.disabled = false;
+    btn.textContent = "Detectar surfistas";
+    return;
+  }
 
   try {
     var r = await fetch("/api/detect-surfers", {
