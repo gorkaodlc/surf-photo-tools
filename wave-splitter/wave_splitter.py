@@ -320,16 +320,17 @@ _embedding_cache: dict[str, np.ndarray] = {}
 
 def _extract_person_features(crop_bgr: np.ndarray) -> np.ndarray:
     """
-    Histograma de color HSV multi-región optimizado para fotografía de surf.
-    Los trajes de neopreno y tablas tienen colores y patrones muy distintivos,
-    lo que hace que el color sea el rasgo más discriminativo para este dominio.
-
-    Vector de 384 dims: 3 regiones verticales × (64 H + 32 S + 16 V) + global (32 H + 16 S)
+    Feature vector para Re-ID de surfistas. Combina:
+      1. Histograma HSV multi-región (384 dims): captura colores del neopreno y la tabla
+      2. Paleta de colores dominantes por k-means (15 dims): firma de color compacta
+         y muy discriminativa para tablas de colores
+    Total: 399 dims, L2-normalizado.
     """
     h_img, w_img = crop_bgr.shape[:2]
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
 
-    # 3 franjas verticales: cabeza/nariz tabla · torso · piernas/cola tabla
+    # 3 franjas verticales del crop (persona+tabla):
+    # top=cabeza/parte superior neopreno · mid=cuerpo · bot=tabla/fins
     regions = [
         hsv[: h_img // 3],
         hsv[h_img // 3 : 2 * h_img // 3],
@@ -338,34 +339,99 @@ def _extract_person_features(crop_bgr: np.ndarray) -> np.ndarray:
 
     parts = []
     for region in regions:
-        parts.append(cv2.calcHist([region], [0], None, [64], [0, 180]).flatten())   # H fino
-        parts.append(cv2.calcHist([region], [1], None, [32], [0, 256]).flatten())   # S
-        parts.append(cv2.calcHist([region], [2], None, [16], [0, 256]).flatten())   # V grueso
+        parts.append(cv2.calcHist([region], [0], None, [64], [0, 180]).flatten())  # H fino
+        parts.append(cv2.calcHist([region], [1], None, [32], [0, 256]).flatten())  # S
+        parts.append(cv2.calcHist([region], [2], None, [16], [0, 256]).flatten())  # V grueso
 
-    # Histograma global a resolución más baja para contexto general de color
+    # Histograma global a resolución más baja
     parts.append(cv2.calcHist([hsv], [0], None, [32], [0, 180]).flatten())
     parts.append(cv2.calcHist([hsv], [1], None, [16], [0, 256]).flatten())
+
+    # Paleta de 5 colores dominantes via k-means en píxeles BGR
+    # Captura colores exactos de la tabla aunque el histograma los difumine
+    try:
+        pixels = crop_bgr.reshape(-1, 3).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, centers = cv2.kmeans(
+            pixels, 5, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+        )
+        counts = np.bincount(labels.flatten(), minlength=5)
+        order = np.argsort(-counts)
+        parts.append((centers[order] / 255.0).flatten().astype(np.float32))  # 15 dims
+    except Exception:
+        parts.append(np.zeros(15, dtype=np.float32))
 
     vec = np.concatenate(parts).astype(np.float32)
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
 
 
+def _extract_crop_for_reid(jpg_path: str, detection: dict) -> np.ndarray | None:
+    """
+    Extrae el crop persona+tabla de la imagen original en alta calidad.
+    Problema del crop anterior: centraba en el TERCIO SUPERIOR del bbox (torso/cabeza),
+    perdiendo completamente la tabla de surf que está DEBAJO del surfista.
+    Esta función usa el bbox completo de YOLO y lo extiende hacia abajo para
+    incluir la tabla, que es el identificador más único de cada surfista.
+    """
+    bbox = detection.get("bbox")
+    if not bbox:
+        return None
+
+    try:
+        img = cv2.imread(jpg_path)
+        if img is None:
+            return None
+
+        h, w = img.shape[:2]
+        x1n, y1n, x2n, y2n = bbox
+
+        # Margen horizontal pequeño para no cortar bordes
+        pad_x = int((x2n - x1n) * w * 0.15)
+        rx1 = max(0, int(x1n * w) - pad_x)
+        rx2 = min(w, int(x2n * w) + pad_x)
+
+        # Margen vertical: un poco arriba + extender bastante hacia ABAJO
+        # para incluir la tabla que está por debajo del bbox de persona
+        person_px_h = (y2n - y1n) * h
+        ry1 = max(0, int(y1n * h) - int(person_px_h * 0.1))
+        ry2 = min(h, int(y2n * h) + int(person_px_h * 0.9))  # +90% extra abajo
+
+        region = img[ry1:ry2, rx1:rx2]
+        if region.size == 0:
+            return None
+
+        return cv2.resize(region, (300, 300), interpolation=cv2.INTER_AREA)
+    except Exception:
+        return None
+
+
 def get_person_embedding(jpg_path: str) -> np.ndarray | None:
-    """Extrae features del crop de persona ya cacheado."""
+    """
+    Extrae features para Re-ID desde la imagen ORIGINAL en alta resolución.
+    Usa el bbox completo de YOLO + extensión hacia abajo para capturar la tabla.
+    Fallback al crop cacheado (thumbnail) si no se puede leer el original.
+    """
     if jpg_path in _embedding_cache:
         return _embedding_cache[jpg_path]
 
     detection = _detection_cache.get(jpg_path)
-    if not detection or not detection.get("crop"):
+    if not detection:
         return None
 
     try:
-        crop_bytes = base64.b64decode(detection["crop"])
-        crop_arr = np.frombuffer(crop_bytes, dtype=np.uint8)
-        crop_bgr = cv2.imdecode(crop_arr, cv2.IMREAD_COLOR)
+        # Intentar crop de alta calidad con tabla incluida
+        crop_bgr = _extract_crop_for_reid(jpg_path, detection)
+
+        # Fallback al JPEG thumbnail cacheado si falla la lectura del original
         if crop_bgr is None:
-            return None
+            cached = detection.get("crop")
+            if not cached:
+                return None
+            arr = np.frombuffer(base64.b64decode(cached), dtype=np.uint8)
+            crop_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if crop_bgr is None:
+                return None
 
         vec = _extract_person_features(crop_bgr)
         _embedding_cache[jpg_path] = vec
@@ -376,7 +442,11 @@ def get_person_embedding(jpg_path: str) -> np.ndarray | None:
 
 
 def get_wave_embedding(photos: list, jpg_dir: Path) -> np.ndarray | None:
-    """Embedding promedio de las fotos de una ola que tengan persona detectada."""
+    """
+    Embedding representativo de una ola.
+    Usa la mediana en lugar de la media para ser más robusto a fotos
+    con detección errónea (p.ej. un espectador en el fondo).
+    """
     embeddings = []
     for p in photos:
         key = str(jpg_dir / p["jpg"])
@@ -385,9 +455,10 @@ def get_wave_embedding(photos: list, jpg_dir: Path) -> np.ndarray | None:
             embeddings.append(emb)
     if not embeddings:
         return None
-    avg = np.mean(embeddings, axis=0)
-    norm = np.linalg.norm(avg)
-    return avg / norm if norm > 0 else avg
+    # Mediana componente a componente — más robusta que la media ante outliers
+    agg = np.median(embeddings, axis=0)
+    norm = np.linalg.norm(agg)
+    return agg / norm if norm > 0 else agg
 
 
 def cluster_waves_by_surfer(wave_embeddings: list, n_surfers: int | None = None) -> list[int]:
