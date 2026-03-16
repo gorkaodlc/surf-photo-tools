@@ -151,18 +151,21 @@ def _make_square_crop(img, cx, cy, radius):
 def _try_yolo(img):
     """
     Fase 1: YOLO — busca 'person' y 'surfboard'.
-    Prioridad: persona > persona+tabla > tabla sola.
-    Ejecuta a múltiples resoluciones para pillar surfistas lejanos.
+    Cuando hay varias personas, elige la más cercana al centro de la imagen
+    ponderada por confianza. Esto evita seleccionar surfistas que están en
+    primer plano (mayor confianza) pero no son el sujeto principal de la foto,
+    que tiende a estar centrado en el encuadre.
     """
     model = _get_yolo()
     h, w = img.shape[:2]
+    img_cx, img_cy = w / 2.0, h / 2.0
 
-    best_person = None
-    best_person_conf = 0
+    all_persons = []   # lista de (score, x1, y1, x2, y2)
     best_board = None
     best_board_conf = 0
 
     # Multi-escala: YOLO a varias resoluciones para surfistas lejos y cerca
+    seen_persons: set[tuple] = set()
     for imgsz in (640, 960, 1280):
         results = model(img, imgsz=imgsz, conf=0.15, verbose=False)
 
@@ -174,19 +177,35 @@ def _try_yolo(img):
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                if cls == PERSON_CLASS and conf > best_person_conf:
-                    best_person = (x1, y1, x2, y2)
-                    best_person_conf = conf
+                if cls == PERSON_CLASS:
+                    # Deduplicar detecciones de distintas escalas por IoU aproximado
+                    key = (x1 // 20, y1 // 20, x2 // 20, y2 // 20)
+                    if key in seen_persons:
+                        continue
+                    seen_persons.add(key)
+
+                    # Distancia normalizada del centro del bbox al centro de imagen
+                    pcx = (x1 + x2) / 2.0
+                    pcy = (y1 + y2) / 2.0
+                    dist = ((pcx - img_cx) / w) ** 2 + ((pcy - img_cy) / h) ** 2
+                    dist_norm = dist ** 0.5  # 0=centro, ~0.7=esquina
+
+                    # Score: 30% confianza + 70% centralidad
+                    # → prefiere la persona centrada aunque sea menos confiable
+                    centrality = 1.0 - min(dist_norm / 0.7, 1.0)
+                    score = 0.3 * conf + 0.7 * centrality
+                    all_persons.append((score, x1, y1, x2, y2))
+
                 elif cls == SURFBOARD_CLASS and conf > best_board_conf:
                     best_board = (x1, y1, x2, y2)
                     best_board_conf = conf
 
-    # Prioridad 1: persona detectada
-    if best_person:
-        x1, y1, x2, y2 = best_person
+    # Prioridad 1: persona más centrada (mayor score)
+    if all_persons:
+        all_persons.sort(key=lambda t: t[0], reverse=True)
+        _, x1, y1, x2, y2 = all_persons[0]
         cx = (x1 + x2) // 2
-        # Centrar en el tercio superior del body (torso/cabeza)
-        cy = y1 + (y2 - y1) // 3
+        cy = y1 + (y2 - y1) // 3   # torso/cabeza para el thumbnail
         bw, bh = x2 - x1, y2 - y1
         radius = int(max(bw, bh) * 0.6)
         bbox = (x1 / w, y1 / h, x2 / w, y2 / h)
@@ -196,7 +215,6 @@ def _try_yolo(img):
     if best_board:
         x1, y1, x2, y2 = best_board
         cx = (x1 + x2) // 2
-        # Subir un poco: surfista está encima de la tabla
         bh = y2 - y1
         cy = y1 - bh // 4
         cy = max(0, cy)
@@ -309,207 +327,6 @@ def get_photo_detection(filepath: Path) -> dict:
 
 def detect_person_thumbnail(filepath: Path) -> str | None:
     return get_photo_detection(filepath)["crop"]
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Detección de surfistas — embeddings + clustering
-# ══════════════════════════════════════════════════════════════════════
-
-_embedding_cache: dict[str, np.ndarray] = {}
-
-
-def _extract_person_features(crop_bgr: np.ndarray) -> np.ndarray:
-    """
-    Feature vector para Re-ID de surfistas. Combina:
-      1. Histograma HSV multi-región (384 dims): captura colores del neopreno y la tabla
-      2. Paleta de colores dominantes por k-means (15 dims): firma de color compacta
-         y muy discriminativa para tablas de colores
-    Total: 399 dims, L2-normalizado.
-    """
-    h_img, w_img = crop_bgr.shape[:2]
-    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-
-    # 3 franjas verticales del crop (persona+tabla):
-    # top=cabeza/parte superior neopreno · mid=cuerpo · bot=tabla/fins
-    regions = [
-        hsv[: h_img // 3],
-        hsv[h_img // 3 : 2 * h_img // 3],
-        hsv[2 * h_img // 3 :],
-    ]
-
-    parts = []
-    for region in regions:
-        parts.append(cv2.calcHist([region], [0], None, [64], [0, 180]).flatten())  # H fino
-        parts.append(cv2.calcHist([region], [1], None, [32], [0, 256]).flatten())  # S
-        parts.append(cv2.calcHist([region], [2], None, [16], [0, 256]).flatten())  # V grueso
-
-    # Histograma global a resolución más baja
-    parts.append(cv2.calcHist([hsv], [0], None, [32], [0, 180]).flatten())
-    parts.append(cv2.calcHist([hsv], [1], None, [16], [0, 256]).flatten())
-
-    # Paleta de 5 colores dominantes via k-means en píxeles BGR
-    # Captura colores exactos de la tabla aunque el histograma los difumine
-    try:
-        pixels = crop_bgr.reshape(-1, 3).astype(np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-        _, labels, centers = cv2.kmeans(
-            pixels, 5, None, criteria, 3, cv2.KMEANS_PP_CENTERS
-        )
-        counts = np.bincount(labels.flatten(), minlength=5)
-        order = np.argsort(-counts)
-        parts.append((centers[order] / 255.0).flatten().astype(np.float32))  # 15 dims
-    except Exception:
-        parts.append(np.zeros(15, dtype=np.float32))
-
-    vec = np.concatenate(parts).astype(np.float32)
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
-
-
-def _extract_crop_for_reid(jpg_path: str, detection: dict) -> np.ndarray | None:
-    """
-    Extrae el crop persona+tabla de la imagen original en alta calidad.
-    Problema del crop anterior: centraba en el TERCIO SUPERIOR del bbox (torso/cabeza),
-    perdiendo completamente la tabla de surf que está DEBAJO del surfista.
-    Esta función usa el bbox completo de YOLO y lo extiende hacia abajo para
-    incluir la tabla, que es el identificador más único de cada surfista.
-    """
-    bbox = detection.get("bbox")
-    if not bbox:
-        return None
-
-    try:
-        img = cv2.imread(jpg_path)
-        if img is None:
-            return None
-
-        h, w = img.shape[:2]
-        x1n, y1n, x2n, y2n = bbox
-
-        # Margen horizontal pequeño para no cortar bordes
-        pad_x = int((x2n - x1n) * w * 0.15)
-        rx1 = max(0, int(x1n * w) - pad_x)
-        rx2 = min(w, int(x2n * w) + pad_x)
-
-        # Margen vertical: un poco arriba + extender bastante hacia ABAJO
-        # para incluir la tabla que está por debajo del bbox de persona
-        person_px_h = (y2n - y1n) * h
-        ry1 = max(0, int(y1n * h) - int(person_px_h * 0.1))
-        ry2 = min(h, int(y2n * h) + int(person_px_h * 0.9))  # +90% extra abajo
-
-        region = img[ry1:ry2, rx1:rx2]
-        if region.size == 0:
-            return None
-
-        return cv2.resize(region, (300, 300), interpolation=cv2.INTER_AREA)
-    except Exception:
-        return None
-
-
-def get_person_embedding(jpg_path: str) -> np.ndarray | None:
-    """
-    Extrae features para Re-ID desde la imagen ORIGINAL en alta resolución.
-    Usa el bbox completo de YOLO + extensión hacia abajo para capturar la tabla.
-    Fallback al crop cacheado (thumbnail) si no se puede leer el original.
-    """
-    if jpg_path in _embedding_cache:
-        return _embedding_cache[jpg_path]
-
-    detection = _detection_cache.get(jpg_path)
-    if not detection:
-        return None
-
-    try:
-        # Intentar crop de alta calidad con tabla incluida
-        crop_bgr = _extract_crop_for_reid(jpg_path, detection)
-
-        # Fallback al JPEG thumbnail cacheado si falla la lectura del original
-        if crop_bgr is None:
-            cached = detection.get("crop")
-            if not cached:
-                return None
-            arr = np.frombuffer(base64.b64decode(cached), dtype=np.uint8)
-            crop_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if crop_bgr is None:
-                return None
-
-        vec = _extract_person_features(crop_bgr)
-        _embedding_cache[jpg_path] = vec
-        return vec
-    except Exception as e:
-        print(f"⚠ Error extrayendo features de {jpg_path}: {e}")
-        return None
-
-
-def get_wave_embedding(photos: list, jpg_dir: Path) -> np.ndarray | None:
-    """
-    Embedding representativo de una ola.
-    Usa la mediana en lugar de la media para ser más robusto a fotos
-    con detección errónea (p.ej. un espectador en el fondo).
-    """
-    embeddings = []
-    for p in photos:
-        key = str(jpg_dir / p["jpg"])
-        emb = get_person_embedding(key)
-        if emb is not None:
-            embeddings.append(emb)
-    if not embeddings:
-        return None
-    # Mediana componente a componente — más robusta que la media ante outliers
-    agg = np.median(embeddings, axis=0)
-    norm = np.linalg.norm(agg)
-    return agg / norm if norm > 0 else agg
-
-
-def cluster_waves_by_surfer(wave_embeddings: list, n_surfers: int | None = None) -> list[int]:
-    """
-    Agrupa olas por surfista usando AgglomerativeClustering (linkage='average', metric='cosine').
-    Cuando el número de surfistas es desconocido, selecciona el N óptimo por silhouette score.
-    Devuelve lista de IDs (0-indexed), -1 para olas sin persona detectada.
-    """
-    from sklearn.cluster import AgglomerativeClustering
-    from sklearn.metrics import silhouette_score
-    from sklearn.preprocessing import normalize
-
-    valid_indices = [i for i, e in enumerate(wave_embeddings) if e is not None]
-    if not valid_indices:
-        return [-1] * len(wave_embeddings)
-    if len(valid_indices) == 1:
-        result = [-1] * len(wave_embeddings)
-        result[valid_indices[0]] = 0
-        return result
-
-    matrix = normalize([wave_embeddings[i] for i in valid_indices])
-    n_valid = len(valid_indices)
-
-    if n_surfers and 1 <= n_surfers <= n_valid:
-        n = n_surfers
-    elif n_valid == 2:
-        n = 2
-    else:
-        # Silhouette-based auto-detection: probar n=2..min(8, n_valid) y elegir el mejor
-        best_n, best_score = 2, -1.0
-        for candidate_n in range(2, min(9, n_valid) + 1):
-            try:
-                labels_tmp = AgglomerativeClustering(
-                    n_clusters=candidate_n, metric="cosine", linkage="average"
-                ).fit_predict(matrix)
-                score = silhouette_score(matrix, labels_tmp, metric="cosine")
-                if score > best_score:
-                    best_score, best_n = score, candidate_n
-            except Exception:
-                pass
-        n = best_n
-        print(f"🏄 Auto-detección: {n} surfistas (silhouette={best_score:.3f})")
-
-    raw_labels = AgglomerativeClustering(
-        n_clusters=n, metric="cosine", linkage="average"
-    ).fit_predict(matrix)
-
-    result = [-1] * len(wave_embeddings)
-    for idx, label in zip(valid_indices, raw_labels):
-        result[idx] = int(label)
-    return result
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -698,24 +515,6 @@ HTML_TEMPLATE = r"""
   .split-menu-item { padding: 9px 14px; cursor: pointer; border-radius: 7px; font-size: 0.84rem; font-weight: 500; transition: background .1s; }
   .split-menu-item:hover { background: var(--accent-light); color: var(--accent); }
 
-  /* Surfer detection */
-  .surfer-select {
-    appearance: none; -webkit-appearance: none;
-    border: 1.5px solid currentColor; border-radius: 20px;
-    padding: 2px 10px; font-size: 0.72rem; font-weight: 800;
-    cursor: pointer; outline: none; transition: opacity .15s;
-    background: transparent;
-  }
-  .surfer-select:hover { opacity: 0.8; }
-  .detect-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 16px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 14px; }
-  .detect-row label { font-size: 0.75rem; font-weight: 700; color: var(--text2); text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
-  .n-surfers-input { width: 80px; background: var(--surface); border: 1.5px solid var(--border); border-radius: 6px; padding: 6px 10px; color: var(--text); font-size: 0.85rem; outline: none; transition: border-color .2s; }
-  .n-surfers-input:focus { border-color: var(--accent); }
-  .n-surfers-input::placeholder { color: #aac4d4; }
-  .detect-progress-wrap { margin-top: 8px; width: 100%; display: none; }
-  .detect-status { font-size: 0.78rem; color: var(--text2); margin-top: 4px; }
-  .group-by-surfer-row { display: none; align-items: center; gap: 8px; font-size: 0.84rem; color: var(--text); margin-bottom: 14px; cursor: pointer; }
-  .group-by-surfer-row input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -782,23 +581,7 @@ HTML_TEMPLATE = r"""
     <div id="waves-container"></div>
     <div id="no-exif-container"></div>
 
-    <div class="detect-row">
-      <label>🏄 Surfistas</label>
-      <button class="btn btn-primary btn-sm" id="btn-detect-surfers" onclick="detectSurfers()">Detectar surfistas</button>
-      <input type="number" id="n-surfers-input" class="n-surfers-input" min="1" max="20" placeholder="Nº (opc.)">
-      <span style="font-size:0.78rem;color:var(--text2);">Si conoces cuántos surfistas hay, escríbelo</span>
-      <div class="detect-progress-wrap" id="detect-progress-wrap">
-        <div class="progress-bar-outer"><div class="progress-bar-inner" id="detect-pbar" style="width:0%">0%</div></div>
-        <div class="detect-status" id="detect-status"></div>
-      </div>
-    </div>
-
-    <label class="group-by-surfer-row" id="group-by-surfer-row">
-      <input type="checkbox" id="group-by-surfer">
-      Organizar carpetas por surfista (ej: <code>surfista_1/ola_001/</code>)
-    </label>
-
-    <div class="actions" style="margin-top: 4px;">
+    <div class="actions" style="margin-top: 16px;">
       <button class="btn btn-success" id="btn-confirm" onclick="startCopy()">✅ Confirmar y copiar</button>
       <button class="btn btn-browse" onclick="document.getElementById('step-preview').classList.remove('visible');document.getElementById('step-preview').classList.add('hidden');">Cancelar</button>
     </div>
@@ -863,17 +646,6 @@ let noExifPhotos = [];
 let currentWaves = [];
 let thumbCache = {};
 let waveThumbIdx = {};
-let surferAssignments = {};   // waveName → surferId (-1 = sin identificar)
-let nSurfersDetected = 0;
-
-const SURFER_COLORS = [
-  "#44bad8","#3dba7e","#ff6a70","#f59e0b","#a78bfa",
-  "#f472b6","#34d399","#fb923c","#60a5fa","#a3e635"
-];
-const SURFER_BG = [
-  "#ddf2f9","#e2f9ef","#fff0f0","#fef9e0","#f3f0ff",
-  "#fde8f5","#d0f7ed","#fff3e0","#e0f0ff","#f0fadf"
-];
 
 async function openBrowser(inputId) {
   browseTarget = inputId;
@@ -980,7 +752,6 @@ function regroup() {
 
   currentWaves = [];
   waveThumbIdx = {};
-  resetSurferState();
   if (allPhotos.length === 0) { renderWaves(); return; }
 
   let wave = [allPhotos[0]];
@@ -1036,7 +807,6 @@ function renderWaves() {
             '<input type="text" class="wave-name-input" id="wave-name-' + idx + '" value="' + (wave.waveName || ('ola_' + num)) + '" title="Editar nombre">' +
             ' <span class="badge">' + wave.length + ' fotos</span>' +
             (noRaw ? ' <span class="badge warn">' + noRaw + ' sin RAW</span>' : '') +
-            ' <select class="surfer-select" id="surfer-select-' + idx + '" style="display:none" onchange="reassignSurfer(' + idx + ',this.value)"></select>' +
           '</h3>' +
           '<div class="meta">🕐 <b>' + first.datetime_str + '</b> — <b>' + last.datetime_str + '</b>' +
             ' · ' + ((new Date(last.datetime_full) - new Date(first.datetime_full)) / 1000).toFixed(1) + 's</div>' +
@@ -1137,9 +907,6 @@ function startCopy() {
   var nameCounts = {};
   wavesData.forEach(function(w) { nameCounts[w.name] = (nameCounts[w.name] || 0) + 1; });
 
-  var groupBySurfer = document.getElementById("group-by-surfer") &&
-                      document.getElementById("group-by-surfer").checked;
-
   var nameIdx = {};
   var finalWaves = wavesData.map(function(w) {
     var folder = w.name;
@@ -1147,12 +914,7 @@ function startCopy() {
       nameIdx[w.name] = (nameIdx[w.name] || 0) + 1;
       folder = w.name + "/ola_" + nameIdx[w.name];
     }
-    var extra = { folder: folder };
-    if (groupBySurfer) {
-      var sid = surferAssignments.hasOwnProperty(w.name) ? surferAssignments[w.name] : -1;
-      extra.surfer_folder = sid >= 0 ? "surfista_" + (sid + 1) : "sin_surfista";
-    }
-    return Object.assign({}, w, extra);
+    return Object.assign({}, w, { folder: folder });
   });
 
   document.getElementById("btn-confirm").disabled = true;
@@ -1278,174 +1040,6 @@ document.addEventListener('click', function(e) {
 function onRawExtChange() {
   var val = document.getElementById('sel-raw-ext').value;
   document.getElementById('raw-dir-row').classList.toggle('disabled', val === 'none');
-}
-
-// ── Detección de surfistas ──────────────────────────────────
-
-function resetSurferState() {
-  surferAssignments = {};
-  nSurfersDetected = 0;
-  document.getElementById("group-by-surfer-row").style.display = "none";
-  document.getElementById("detect-progress-wrap").style.display = "none";
-  document.getElementById("detect-status").textContent = "";
-  var btn = document.getElementById("btn-detect-surfers");
-  if (btn) { btn.disabled = false; btn.textContent = "Detectar surfistas"; }
-}
-
-async function detectSurfers() {
-  var jpg = document.getElementById("inp-jpg").value.trim();
-  if (!jpg) { alert("Selecciona primero una carpeta de JPGs"); return; }
-  if (currentWaves.length === 0) { alert("Primero analiza las fotos"); return; }
-
-  syncWaveNames();
-
-  var btn = document.getElementById("btn-detect-surfers");
-  btn.disabled = true;
-  btn.textContent = "⏳ Detectando...";
-
-  var wrap = document.getElementById("detect-progress-wrap");
-  wrap.style.display = "block";
-  document.getElementById("detect-pbar").style.width = "0%";
-  document.getElementById("detect-pbar").textContent = "0%";
-  document.getElementById("detect-status").textContent = "Iniciando análisis...";
-
-  var nVal = document.getElementById("n-surfers-input").value;
-  var nSurfers = nVal ? parseInt(nVal) : null;
-
-  // Solo analizar olas que están activas (toggle activado)
-  var wavesData = currentWaves
-    .map(function(w, i) {
-      var toggle = document.getElementById("wave-toggle-" + i);
-      if (toggle && !toggle.checked) return null;
-      return { name: w.waveName || ("ola_" + String(i+1).padStart(3,"0")), photos: w };
-    })
-    .filter(Boolean);
-
-  if (wavesData.length === 0) {
-    alert("No hay olas activas para analizar");
-    btn.disabled = false;
-    btn.textContent = "Detectar surfistas";
-    return;
-  }
-
-  try {
-    var r = await fetch("/api/detect-surfers", {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({jpg_dir: jpg, waves: wavesData, n_surfers: nSurfers})
-    });
-    var data = await r.json();
-    if (data.stream_id) listenDetection(data.stream_id);
-    else throw new Error(data.error || "Error desconocido");
-  } catch(e) {
-    alert("Error: " + e.message);
-    btn.disabled = false;
-    btn.textContent = "Detectar surfistas";
-  }
-}
-
-function listenDetection(streamId) {
-  var es = new EventSource("/api/progress/" + streamId);
-  es.onmessage = function(evt) {
-    var msg = JSON.parse(evt.data);
-
-    if (msg.type === "progress") {
-      var pct = msg.pct || 0;
-      document.getElementById("detect-pbar").style.width = pct + "%";
-      document.getElementById("detect-pbar").textContent = pct + "%";
-      if (msg.msg) document.getElementById("detect-status").textContent = msg.msg;
-    }
-
-    if (msg.type === "done") {
-      es.close();
-      surferAssignments = msg.assignments || {};
-      nSurfersDetected = msg.n_surfers || 0;
-
-      var statusText = "✅ " + nSurfersDetected + " surfista(s) detectado(s)";
-      if (msg.unassigned && msg.unassigned.length)
-        statusText += " · " + msg.unassigned.length + " ola(s) sin persona detectada";
-      document.getElementById("detect-status").textContent = statusText;
-
-      applySurferColors();
-
-      var btn = document.getElementById("btn-detect-surfers");
-      btn.disabled = false;
-      btn.textContent = "🔄 Re-detectar";
-
-      if (nSurfersDetected > 1) {
-        document.getElementById("group-by-surfer-row").style.display = "flex";
-      }
-    }
-
-    if (msg.type === "error") {
-      es.close();
-      alert("Error en detección: " + msg.msg);
-      document.getElementById("btn-detect-surfers").disabled = false;
-      document.getElementById("btn-detect-surfers").textContent = "Detectar surfistas";
-    }
-  };
-  es.onerror = function() {
-    es.close();
-    document.getElementById("btn-detect-surfers").disabled = false;
-    document.getElementById("btn-detect-surfers").textContent = "Detectar surfistas";
-  };
-}
-
-function applySurferColors() {
-  currentWaves.forEach(function(wave, idx) {
-    var block = document.getElementById("wave-block-" + idx);
-    if (!block) return;
-
-    var waveName = wave.waveName || ("ola_" + String(idx+1).padStart(3,"0"));
-    var surferId = surferAssignments.hasOwnProperty(waveName) ? surferAssignments[waveName] : -1;
-
-    // Border color
-    if (surferId >= 0) {
-      block.style.borderColor = SURFER_COLORS[surferId % SURFER_COLORS.length];
-      block.style.borderWidth = "2.5px";
-    } else {
-      block.style.borderColor = "";
-      block.style.borderWidth = "";
-    }
-
-    // Surfer select
-    var sel = document.getElementById("surfer-select-" + idx);
-    if (!sel) return;
-
-    sel.innerHTML = "";
-    var maxId = Math.max(nSurfersDetected - 1, surferId);
-    for (var s = 0; s <= maxId; s++) {
-      var opt = document.createElement("option");
-      opt.value = s;
-      opt.textContent = "Surfista " + (s + 1);
-      opt.selected = (s === surferId);
-      sel.appendChild(opt);
-    }
-    var optNone = document.createElement("option");
-    optNone.value = -1;
-    optNone.textContent = "Sin identificar";
-    optNone.selected = (surferId === -1);
-    sel.appendChild(optNone);
-
-    if (surferId >= 0) {
-      sel.style.color = SURFER_COLORS[surferId % SURFER_COLORS.length];
-      sel.style.borderColor = SURFER_COLORS[surferId % SURFER_COLORS.length];
-      sel.style.background = SURFER_BG[surferId % SURFER_BG.length];
-    } else {
-      sel.style.color = "var(--text2)";
-      sel.style.borderColor = "var(--border)";
-      sel.style.background = "var(--surface2)";
-    }
-    sel.style.display = "inline-block";
-  });
-}
-
-function reassignSurfer(idx, newSurferId) {
-  var wave = currentWaves[idx];
-  if (!wave) return;
-  var waveName = wave.waveName || ("ola_" + String(idx+1).padStart(3,"0"));
-  surferAssignments[waveName] = parseInt(newSurferId);
-  applySurferColors();
 }
 
 // ── Lightbox ────────────────────────────────────────────────
@@ -1660,74 +1254,6 @@ def api_thumbnail():
     return jsonify(thumbnail=thumb)
 
 
-@app.route("/api/detect-surfers", methods=["POST"])
-def api_detect_surfers():
-    data = request.json
-    stream_id = f"ds-{int(time.time()*1000)}"
-    q = Queue()
-    progress_queues[stream_id] = q
-    thread = threading.Thread(target=do_detect_surfers, args=(data, q, stream_id), daemon=True)
-    thread.start()
-    return jsonify(stream_id=stream_id)
-
-
-def do_detect_surfers(data, q: Queue, stream_id: str):
-    jpg_dir = Path(data["jpg_dir"])
-    waves = data["waves"]
-    n_surfers = data.get("n_surfers")
-    if n_surfers is not None:
-        try:
-            n_surfers = int(n_surfers)
-            if n_surfers < 1:
-                n_surfers = None
-        except (ValueError, TypeError):
-            n_surfers = None
-
-    total = len(waves)
-    wave_embeddings = []
-
-    for i, wave in enumerate(waves):
-        wave_name = wave.get("name", f"ola_{i + 1}")
-        pct = int(i / max(total, 1) * 80)
-        q.put({"type": "progress", "pct": pct, "msg": f"Analizando {wave_name} ({i + 1}/{total})..."})
-
-        photos = wave.get("photos", [])
-        # Ensure YOLO detections are cached for all photos in this wave
-        for p in photos:
-            fp = jpg_dir / p["jpg"]
-            if str(fp) not in _detection_cache:
-                get_photo_detection(fp)
-
-        emb = get_wave_embedding(photos, jpg_dir)
-        wave_embeddings.append(emb)
-
-    q.put({"type": "progress", "pct": 85, "msg": "Agrupando por surfista..."})
-
-    try:
-        labels = cluster_waves_by_surfer(wave_embeddings, n_surfers)
-    except Exception as e:
-        q.put({"type": "error", "msg": f"Error en clustering: {e}"})
-        q.put(None)
-        progress_queues.pop(stream_id, None)
-        return
-
-    assignments = {}
-    unassigned = []
-    for i, wave in enumerate(waves):
-        wave_name = wave.get("name", f"ola_{i + 1}")
-        label = labels[i]
-        assignments[wave_name] = label
-        if label == -1:
-            unassigned.append(wave_name)
-
-    n_detected = len(set(l for l in labels if l >= 0))
-
-    q.put({"type": "progress", "pct": 100, "msg": f"¡Listo! {n_detected} surfista(s) detectado(s)."})
-    q.put({"type": "done", "assignments": assignments, "n_surfers": n_detected, "unassigned": unassigned})
-    q.put(None)
-    time.sleep(5)
-    progress_queues.pop(stream_id, None)
-
 
 @app.route("/api/copy", methods=["POST"])
 def api_copy():
@@ -1754,20 +1280,13 @@ def do_copy(data, q: Queue, stream_id: str):
 
     for wave in waves:
         wave_name = wave.get("folder", wave["name"])
-        surfer_folder = wave.get("surfer_folder")  # e.g. "surfista_1" or None
-        if surfer_folder:
-            dest_jpg = out_dir / surfer_folder / wave_name / "jpg"
-            dest_raw = out_dir / surfer_folder / wave_name / "raw"
-        else:
-            dest_jpg = out_dir / wave_name / "jpg"
-            dest_raw = out_dir / wave_name / "raw"
+        dest_jpg = out_dir / wave_name / "jpg"
+        dest_raw = out_dir / wave_name / "raw"
         dest_jpg.mkdir(parents=True, exist_ok=True)
         dest_raw.mkdir(parents=True, exist_ok=True)
 
         display_name = wave["name"]
-        if surfer_folder:
-            display_name = f"{surfer_folder} / {display_name}"
-        elif wave_name != display_name:
+        if wave_name != display_name:
             display_name = wave_name.replace("/", " → ")
 
         q.put({"type": "log", "level": "info", "text": f"── {display_name} ({len(wave['photos'])} fotos) ──"})
