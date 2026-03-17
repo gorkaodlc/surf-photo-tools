@@ -13,6 +13,7 @@ Se abrirá en http://127.0.0.1:5070
 import base64
 import io
 import json
+import math
 import os
 import shutil
 import socket
@@ -29,7 +30,7 @@ from queue import Queue
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify, Response, render_template_string
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 from PIL.ExifTags import Base as ExifBase
 from ultralytics import YOLO
 
@@ -61,15 +62,95 @@ def get_exif_datetime(filepath: Path) -> datetime | None:
     return None
 
 
+# Ruta al watermark PNG (sin fondo)
+WATERMARK_PATH = Path(__file__).parent / "assets" / "watermark.png"
+_watermark_cache: Image.Image | None = None
+
+
+def _get_watermark() -> Image.Image | None:
+    """Carga y cachea el watermark PNG con canal alpha."""
+    global _watermark_cache
+    if _watermark_cache is not None:
+        return _watermark_cache
+    if not WATERMARK_PATH.exists():
+        return None
+    try:
+        wm = Image.open(WATERMARK_PATH).convert("RGBA")
+        _watermark_cache = wm
+        return wm
+    except Exception:
+        return None
+
+
+def _apply_watermark(img: Image.Image) -> Image.Image:
+    """
+    Aplica el watermark en diagonal desde esquina superior-izquierda
+    a inferior-derecha, escalado grande y con opacidad ~40%.
+    """
+    wm_orig = _get_watermark()
+    if wm_orig is None:
+        return img
+
+    img = img.convert("RGBA")
+    iw, ih = img.size
+
+    # Diagonal exacta de la imagen → el watermark tendrá ese ancho
+    # para que sus extremos toquen las esquinas TL y BR
+    diag = math.sqrt(iw ** 2 + ih ** 2)
+    angle_deg = math.degrees(math.atan2(ih, iw))  # ángulo de la diagonal
+
+    # Escalar watermark al largo de la diagonal
+    wm = wm_orig.copy()
+    ratio = diag / wm.width
+    wm = wm.resize((int(diag), max(1, int(wm.height * ratio))), Image.LANCZOS)
+
+    # PIL rota en sentido antihorario → negamos para rotar en sentido horario (TL→BR)
+    wm = wm.rotate(-angle_deg, expand=True, resample=Image.BICUBIC)
+
+    # Difuminar ligeramente
+    wm = wm.filter(ImageFilter.GaussianBlur(radius=1.5))
+
+    # Reducir opacidad al 40%
+    r, g, b, a = wm.split()
+    a = a.point(lambda x: int(x * 0.40))
+    wm = Image.merge("RGBA", (r, g, b, a))
+
+    # Centrar en la imagen
+    paste_x = (iw - wm.width) // 2
+    paste_y = (ih - wm.height) // 2
+    img.paste(wm, (paste_x, paste_y), wm)
+
+    return img.convert("RGB")
+
+
 def make_thumbnail_b64(filepath: Path, size: int = 300) -> str | None:
     try:
         with Image.open(filepath) as img:
+            img = ImageOps.exif_transpose(img)
             img.thumbnail((size, size), Image.LANCZOS)
+            img = _apply_watermark(img)
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=80)
+            img.save(buf, format="JPEG", quality=15)
             return base64.b64encode(buf.getvalue()).decode()
     except Exception:
         return None
+
+
+def make_watermarked_preview(filepath: Path, out_path: Path, size: int = 1200) -> bool:
+    """
+    Genera una previsualización con marca de agua y la guarda en out_path.
+    Calidad reducida (baja resolución + compresión alta).
+    """
+    try:
+        with Image.open(filepath) as img:
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((size, size), Image.LANCZOS)
+            img = _apply_watermark(img)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            img.save(out_path, format="JPEG", quality=55)
+        return True
+    except Exception:
+        return False
 
 
 def scan_photos(jpg_dir: Path, raw_dir: Path, jpg_ext: str = ".jpg", raw_ext: str = ".arw"):
@@ -151,18 +232,21 @@ def _make_square_crop(img, cx, cy, radius):
 def _try_yolo(img):
     """
     Fase 1: YOLO — busca 'person' y 'surfboard'.
-    Prioridad: persona > persona+tabla > tabla sola.
-    Ejecuta a múltiples resoluciones para pillar surfistas lejanos.
+    Cuando hay varias personas, elige la más cercana al centro de la imagen
+    ponderada por confianza. Esto evita seleccionar surfistas que están en
+    primer plano (mayor confianza) pero no son el sujeto principal de la foto,
+    que tiende a estar centrado en el encuadre.
     """
     model = _get_yolo()
     h, w = img.shape[:2]
+    img_cx, img_cy = w / 2.0, h / 2.0
 
-    best_person = None
-    best_person_conf = 0
+    all_persons = []   # lista de (score, x1, y1, x2, y2)
     best_board = None
     best_board_conf = 0
 
     # Multi-escala: YOLO a varias resoluciones para surfistas lejos y cerca
+    seen_persons: set[tuple] = set()
     for imgsz in (640, 960, 1280):
         results = model(img, imgsz=imgsz, conf=0.15, verbose=False)
 
@@ -174,19 +258,35 @@ def _try_yolo(img):
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                if cls == PERSON_CLASS and conf > best_person_conf:
-                    best_person = (x1, y1, x2, y2)
-                    best_person_conf = conf
+                if cls == PERSON_CLASS:
+                    # Deduplicar detecciones de distintas escalas por IoU aproximado
+                    key = (x1 // 20, y1 // 20, x2 // 20, y2 // 20)
+                    if key in seen_persons:
+                        continue
+                    seen_persons.add(key)
+
+                    # Distancia normalizada del centro del bbox al centro de imagen
+                    pcx = (x1 + x2) / 2.0
+                    pcy = (y1 + y2) / 2.0
+                    dist = ((pcx - img_cx) / w) ** 2 + ((pcy - img_cy) / h) ** 2
+                    dist_norm = dist ** 0.5  # 0=centro, ~0.7=esquina
+
+                    # Score: 60% confianza + 40% centralidad
+                    # → prioriza detecciones seguras, centralidad como desempate
+                    centrality = 1.0 - min(dist_norm / 0.7, 1.0)
+                    score = 0.6 * conf + 0.4 * centrality
+                    all_persons.append((score, x1, y1, x2, y2))
+
                 elif cls == SURFBOARD_CLASS and conf > best_board_conf:
                     best_board = (x1, y1, x2, y2)
                     best_board_conf = conf
 
-    # Prioridad 1: persona detectada
-    if best_person:
-        x1, y1, x2, y2 = best_person
+    # Prioridad 1: persona más centrada (mayor score)
+    if all_persons:
+        all_persons.sort(key=lambda t: t[0], reverse=True)
+        _, x1, y1, x2, y2 = all_persons[0]
         cx = (x1 + x2) // 2
-        # Centrar en el tercio superior del body (torso/cabeza)
-        cy = y1 + (y2 - y1) // 3
+        cy = y1 + (y2 - y1) // 3   # torso/cabeza para el thumbnail
         bw, bh = x2 - x1, y2 - y1
         radius = int(max(bw, bh) * 0.6)
         bbox = (x1 / w, y1 / h, x2 / w, y2 / h)
@@ -196,7 +296,6 @@ def _try_yolo(img):
     if best_board:
         x1, y1, x2, y2 = best_board
         cx = (x1 + x2) // 2
-        # Subir un poco: surfista está encima de la tabla
         bh = y2 - y1
         cy = y1 - bh // 4
         cy = max(0, cy)
@@ -481,7 +580,6 @@ HTML_TEMPLATE = r"""
   .lightbox-bg.open { display: flex; }
   .lightbox-wrap { position: relative; display: inline-flex; max-width: 90vw; max-height: 82vh; }
   .lightbox-img { max-width: 90vw; max-height: 82vh; object-fit: contain; border-radius: 6px; transition: opacity .15s; display: block; box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
-  #lightbox-detect-crop { position: absolute; bottom: 12px; left: 12px; width: 165px; height: 165px; border-radius: 10px; border: 2.5px solid rgba(255,255,255,0.8); object-fit: cover; box-shadow: 0 4px 20px rgba(0,0,0,0.7); display: none; }
   .lightbox-close { position: absolute; top: 16px; right: 20px; background: rgba(255,255,255,0.1); border: none; color: #fff; font-size: 1.3rem; cursor: pointer; width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: background .15s; }
   .lightbox-close:hover { background: rgba(255,255,255,0.2); }
   .lightbox-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.08); border: none; color: #fff; font-size: 3rem; cursor: pointer; opacity: .55; padding: 12px; line-height: 1; border-radius: 8px; transition: opacity .15s, background .15s; }
@@ -496,6 +594,7 @@ HTML_TEMPLATE = r"""
   #split-menu { display: none; position: fixed; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 4px; z-index: 200; box-shadow: 0 8px 30px rgba(0,0,0,0.1); min-width: 180px; }
   .split-menu-item { padding: 9px 14px; cursor: pointer; border-radius: 7px; font-size: 0.84rem; font-weight: 500; transition: background .1s; }
   .split-menu-item:hover { background: var(--accent-light); color: var(--accent); }
+
 </style>
 </head>
 <body>
@@ -561,6 +660,7 @@ HTML_TEMPLATE = r"""
     </div>
     <div id="waves-container"></div>
     <div id="no-exif-container"></div>
+
     <div class="actions" style="margin-top: 16px;">
       <button class="btn btn-success" id="btn-confirm" onclick="startCopy()">✅ Confirmar y copiar</button>
       <button class="btn btn-browse" onclick="document.getElementById('step-preview').classList.remove('visible');document.getElementById('step-preview').classList.add('hidden');">Cancelar</button>
@@ -608,7 +708,6 @@ HTML_TEMPLATE = r"""
   <button class="lightbox-nav lightbox-prev" onclick="navLightbox(-1)">‹</button>
   <div class="lightbox-wrap">
     <img class="lightbox-img" id="lightbox-img" src="" alt="">
-    <img id="lightbox-detect-crop" src="" alt="Detección">
   </div>
   <div class="lightbox-footer">
     <span class="lightbox-caption" id="lightbox-caption"></span>
@@ -778,7 +877,7 @@ function renderWaves() {
         '<div class="drag-handle" draggable="true" title="Arrastrar para unir con otra ola">⠿</div>' +
         '<input type="checkbox" class="wave-toggle" id="wave-toggle-' + idx + '" checked onchange="toggleWave(' + idx + ')" title="Incluir / excluir">' +
         '<div>' +
-          '<img class="wave-thumb" id="thumb-' + idx + '" onclick="openLightbox(' + idx + ', waveThumbIdx[' + idx + '] || 0)" ' +
+          '<img class="wave-thumb" id="thumb-' + idx + '" onclick="openLightbox(' + idx + ', 0)" ' +
             'src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" title="Clic para ver foto completa">' +
           '<div class="wave-thumb-counter" id="thumb-counter-' + idx + '"></div>' +
         '</div>' +
@@ -801,8 +900,8 @@ function renderWaves() {
     container.appendChild(block);
     setupDragHandlers(block, idx);
 
-    waveThumbIdx[idx] = 0;
-    loadWaveThumb(idx, 0);
+    // Foto central con detección, o la más cercana que la tenga
+    loadBestWaveThumb(idx);
   });
 
   const noExifBox = document.getElementById("no-exif-container");
@@ -842,6 +941,29 @@ async function loadWaveThumb(waveIdx, photoIdx) {
       if (el) el.src = "data:image/jpeg;base64," + data.thumbnail;
     }
   } catch(e) { console.error("Thumb error:", e); }
+}
+
+async function loadBestWaveThumb(waveIdx) {
+  const wave = currentWaves[waveIdx];
+  if (!wave || !wave.length) return;
+  const jpg = document.getElementById("inp-jpg").value.trim();
+  const el = document.getElementById("thumb-" + waveIdx);
+  const counter = document.getElementById("thumb-counter-" + waveIdx);
+  try {
+    const r = await fetch("/api/wave-thumbnail", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({jpg_dir: jpg, photos: wave.map(function(p){ return p.jpg; })})
+    });
+    const data = await r.json();
+    if (data.thumbnail) {
+      var photoIdx = data.photo_idx;
+      waveThumbIdx[waveIdx] = photoIdx;
+      thumbCache[wave[photoIdx].jpg] = data.thumbnail;
+      if (el) el.src = "data:image/jpeg;base64," + data.thumbnail;
+      if (counter) counter.textContent = (photoIdx + 1) + " / " + wave.length;
+      updateDotActive(waveIdx, photoIdx);
+    }
+  } catch(e) { console.error("Wave thumb error:", e); }
 }
 
 function cycleWaveThumb(waveIdx) {
@@ -889,11 +1011,12 @@ function startCopy() {
 
   var nameIdx = {};
   var finalWaves = wavesData.map(function(w) {
+    var folder = w.name;
     if (nameCounts[w.name] > 1) {
       nameIdx[w.name] = (nameIdx[w.name] || 0) + 1;
-      return Object.assign({}, w, { folder: w.name + "/ola_" + nameIdx[w.name] });
+      folder = w.name + "/ola_" + nameIdx[w.name];
     }
-    return Object.assign({}, w, { folder: w.name });
+    return Object.assign({}, w, { folder: folder });
   });
 
   document.getElementById("btn-confirm").disabled = true;
@@ -1035,7 +1158,6 @@ function openLightbox(waveIdx, photoIdx) {
 function closeLightbox() {
   document.getElementById('lightbox').classList.remove('open');
   document.getElementById('lightbox-img').src = '';
-  document.getElementById('lightbox-detect-crop').style.display = 'none';
 }
 
 function navLightbox(dir) {
@@ -1051,24 +1173,16 @@ async function loadLightboxPhoto() {
   var imgEl = document.getElementById('lightbox-img');
   var caption = document.getElementById('lightbox-caption');
   var splitBtn = document.getElementById('lightbox-split-btn');
-  var detectCrop = document.getElementById('lightbox-detect-crop');
 
   imgEl.style.opacity = '0.35';
   caption.textContent = photo.jpg + '  (' + (_lbIdx + 1) + ' / ' + wave.length + ')';
   splitBtn.style.display = _lbIdx > 0 ? '' : 'none';
-  detectCrop.style.display = 'none';
 
   try {
     var r = await fetch("/api/photo-full", { method: "POST", headers: {"Content-Type":"application/json"},
       body: JSON.stringify({jpg_dir: jpg, filename: photo.jpg}) });
     var data = await r.json();
     if (data.data) {
-      imgEl.onload = function() {
-        if (data.crop) {
-          detectCrop.src = "data:image/jpeg;base64," + data.crop;
-          detectCrop.style.display = 'block';
-        }
-      };
       imgEl.src = "data:image/jpeg;base64," + data.data;
       imgEl.style.opacity = '1';
     }
@@ -1179,14 +1293,38 @@ def api_photo_full():
     if not filepath.exists():
         return jsonify(error="Archivo no encontrado")
     try:
+        det = get_photo_detection(filepath)
+
         with Image.open(filepath) as img:
             img = ImageOps.exif_transpose(img)
-            img.thumbnail((1920, 1920), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-            img_b64 = base64.b64encode(buf.getvalue()).decode()
-        det = get_photo_detection(filepath)
-        return jsonify(data=img_b64, crop=det["crop"], bbox=det["bbox"])
+            img.thumbnail((800, 800), Image.LANCZOS)
+
+            # Paso 1: fondo + watermark a baja calidad
+            img_wm = _apply_watermark(img.copy())
+            bg_buf = io.BytesIO()
+            img_wm.save(bg_buf, format="JPEG", quality=15)
+            bg_buf.seek(0)
+            base_img = Image.open(bg_buf)
+            base_img.load()  # forzar lectura antes de cerrar el buffer
+
+        # Paso 2: pegar el recorte de detección a ALTA calidad sobre el fondo ya degradado
+        if det["crop"]:
+            try:
+                crop_img = Image.open(io.BytesIO(base64.b64decode(det["crop"]))).convert("RGB")
+                crop_size = min(int(base_img.width * 0.20), 165)
+                crop_img = crop_img.resize((crop_size, crop_size), Image.LANCZOS)
+                bordered = Image.new("RGB", (crop_size + 6, crop_size + 6), (255, 255, 255))
+                bordered.paste(crop_img, (3, 3))
+                margin = 12
+                base_img.paste(bordered, (margin, base_img.height - bordered.height - margin))
+            except Exception:
+                pass
+
+        # Paso 3: guardar el resultado final a calidad alta (fondo ya degradado, crop nítido)
+        final_buf = io.BytesIO()
+        base_img.save(final_buf, format="JPEG", quality=85)
+        img_b64 = base64.b64encode(final_buf.getvalue()).decode()
+        return jsonify(data=img_b64, crop=None, bbox=det.get("bbox") if det else None)
     except Exception as e:
         return jsonify(error=str(e))
 
@@ -1218,6 +1356,14 @@ def api_scan():
     return jsonify(photos=photos, no_exif=no_exif, total_files=total_files, subdirs=subdirs)
 
 
+@app.route("/assets/watermark.png")
+def serve_watermark():
+    from flask import send_file
+    if WATERMARK_PATH.exists():
+        return send_file(WATERMARK_PATH, mimetype="image/png")
+    return "", 404
+
+
 @app.route("/api/thumbnail", methods=["POST"])
 def api_thumbnail():
     data = request.json
@@ -1231,6 +1377,43 @@ def api_thumbnail():
     if not thumb:
         thumb = make_thumbnail_b64(filepath, 300)
     return jsonify(thumbnail=thumb)
+
+
+@app.route("/api/wave-thumbnail", methods=["POST"])
+def api_wave_thumbnail():
+    """
+    Devuelve el thumbnail de la foto más cercana al centro de la ola
+    que tenga detección de persona. Si ninguna tiene, usa la central.
+    """
+    data = request.json
+    jpg_dir = Path(data["jpg_dir"])
+    photos = data["photos"]  # lista de nombres de archivo
+
+    n = len(photos)
+    mid = n // 2
+
+    # Orden de búsqueda: centro, luego alternando izq/der
+    order = [mid]
+    for offset in range(1, n):
+        if mid - offset >= 0:
+            order.append(mid - offset)
+        if mid + offset < n:
+            order.append(mid + offset)
+
+    # Buscar la más cercana al centro con detección de persona
+    for idx in order:
+        filepath = jpg_dir / photos[idx]
+        if not filepath.exists():
+            continue
+        det = get_photo_detection(filepath)
+        if det["crop"] is not None:
+            return jsonify(thumbnail=det["crop"], photo_idx=idx)
+
+    # Ninguna tiene detección → thumbnail normal de la foto central
+    filepath = jpg_dir / photos[mid]
+    thumb = make_thumbnail_b64(filepath, 300)
+    return jsonify(thumbnail=thumb, photo_idx=mid)
+
 
 
 @app.route("/api/copy", methods=["POST"])
@@ -1268,6 +1451,17 @@ def do_copy(data, q: Queue, stream_id: str):
             display_name = wave_name.replace("/", " → ")
 
         q.put({"type": "log", "level": "info", "text": f"── {display_name} ({len(wave['photos'])} fotos) ──"})
+
+        # Previsualización con marca de agua: foto intermedia de la ola
+        photos_list = wave["photos"]
+        mid_idx = len(photos_list) // 2
+        mid_photo = photos_list[mid_idx]["jpg"]
+        mid_src = jpg_dir / mid_photo
+        preview_path = out_dir / wave_name / "preview.jpg"
+        if mid_src.exists():
+            ok = make_watermarked_preview(mid_src, preview_path)
+            if ok:
+                q.put({"type": "log", "level": "ok", "text": f"  🖼 Preview guardada: preview.jpg"})
 
         for p in wave["photos"]:
             jpg_name = p["jpg"]

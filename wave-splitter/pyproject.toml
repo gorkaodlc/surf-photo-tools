@@ -9,4 +9,5 @@ dependencies = [
     "opencv-contrib-python-headless>=4.13.0.92",
     "pillow>=12.1.1",
     "ultralytics>=8.4.19",
+    "scikit-learn>=1.4",
 ]
